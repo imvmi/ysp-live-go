@@ -1,0 +1,8 @@
+/ysp-live-go
+/ysptp-backend.log
+/device-state-rs.json
+/proxy-cache-state-rs.json
+/dist/
+*.test
+coverage.out
+.DS_Store
