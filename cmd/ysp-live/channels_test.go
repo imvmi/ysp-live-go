@@ -32,7 +32,13 @@ func (r *testRoutingTransport) RoundTrip(req *http.Request) (*http.Response, err
 	copyReq.URL = &u
 	copyReq.Header.Set("X-Upstream-Host", req.URL.Hostname())
 	copyReq.Host = r.base.Host
-	return r.transport.RoundTrip(copyReq)
+	resp, err := r.transport.RoundTrip(copyReq)
+	if resp != nil {
+		// Preserve the logical upstream origin for relative child playlists.
+		// The simulation route prefix is a transport detail, not part of HLS.
+		resp.Request = req
+	}
+	return resp, err
 }
 
 func testManager(t *testing.T, upstream string) (*channelManager, *channel) {
@@ -49,7 +55,6 @@ func testManager(t *testing.T, upstream string) (*channelManager, *channel) {
 	t.Cleanup(m.Close)
 	ch := m.channels["cctv11"]
 	ch.bkURLs = []string{"https://bklive-test.ysp.cctv.cn/live.m3u8"}
-	ch.bkURLsTime = time.Now()
 	// Reproduce reopening a previously viewed channel after six months.
 	ch.bkPlaylist = "#EXTM3U\n#EXTINF:6,\nhttps://old.invalid/expired.ts\n"
 	ch.lastOK = time.Now().Add(-180 * 24 * time.Hour)
@@ -188,6 +193,7 @@ func TestStaleFailureBackoffAndRecovery(t *testing.T) {
 	failing.Store(false)
 	ch.mu.Lock()
 	ch.nextRetry = time.Time{}
+	expireSourceCooldowns(ch)
 	ch.mu.Unlock()
 	if err := m.ensure(context.Background(), ch); err != nil {
 		t.Fatal(err)
@@ -310,7 +316,6 @@ func TestDiscoveryOutageKeepsWorkingCDNCandidate(t *testing.T) {
 	}))
 	defer upstream.Close()
 	m, ch := testManager(t, upstream.URL)
-	ch.bkURLsTime = time.Time{}
 	if err := m.ensure(context.Background(), ch); err != nil {
 		t.Fatal(err)
 	}
@@ -433,11 +438,13 @@ func TestPostmanSimulation(t *testing.T) {
 	ch.mu.Lock()
 	ch.lastOK = time.Now().Add(-time.Hour)
 	ch.nextRetry = time.Time{}
+	expireSourceCooldowns(ch)
 	ch.mu.Unlock()
 	request(503)
 	control("ok")
 	ch.mu.Lock()
 	ch.nextRetry = time.Time{}
+	expireSourceCooldowns(ch)
 	ch.mu.Unlock()
 	request(200)
 }

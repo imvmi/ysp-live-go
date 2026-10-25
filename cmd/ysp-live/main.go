@@ -23,6 +23,7 @@ func main() {
 	port := flag.Int("port", 8767, "HTTP 服务端口")
 	backendFlag := flag.String("backend", "", "4K 后端路径；使用 auto 自动寻找；留空则禁用")
 	backendPort := flag.Int("backend-port", 8766, "4K 后端端口")
+	maxBandwidth := flag.Int64("max-bandwidth", defaultMaxBandwidth, "多码率直播选择上限（bit/s）；0 选择最高码率")
 	showVersion := flag.Bool("version", false, "显示版本")
 	flag.Parse()
 	if *showVersion {
@@ -38,6 +39,9 @@ func main() {
 	}
 	if *port < 1 || *port > 65535 || *backendPort < 1 || *backendPort > 65535 {
 		log.Fatal("port must be between 1 and 65535")
+	}
+	if *maxBandwidth < 0 {
+		log.Fatal("max-bandwidth must be non-negative")
 	}
 	if net.ParseIP(*bind) == nil && *bind != "localhost" {
 		log.Fatalf("invalid bind address %q", *bind)
@@ -61,6 +65,7 @@ func main() {
 	client := &http.Client{Transport: transport, Timeout: 35 * time.Second}
 	defer transport.CloseIdleConnections()
 	channels := newChannelManager(client)
+	channels.maxBandwidth = *maxBandwidth
 	defer channels.Close()
 	backend := newBackendManager(client, backendPath, *backendPort, executableDir)
 

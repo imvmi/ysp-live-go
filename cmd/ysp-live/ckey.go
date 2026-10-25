@@ -360,7 +360,9 @@ func bkPlayURLs(ctx context.Context, client *http.Client, channelID, livePID, de
 		if ib != jb {
 			return ib
 		}
-		return urls[i] < urls[j]
+		// Retain the upstream's priority within a CDN class. The channel
+		// worker learns which candidate actually performs best.
+		return false
 	})
 	return urls, nil
 }
@@ -389,7 +391,7 @@ func rewriteURIAttributes(line string, base *url.URL) string {
 	}
 }
 
-func fetchAbsolutePlaylist(ctx context.Context, client *http.Client, rawURL string, depth int) (string, error) {
+func fetchAbsolutePlaylist(ctx context.Context, client *http.Client, rawURL string, depth int, bandwidthLimit int64) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", err
@@ -415,22 +417,19 @@ func fetchAbsolutePlaylist(ctx context.Context, client *http.Client, rawURL stri
 	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "#EXTM3U" {
 		return "", errors.New("response is not an M3U8 playlist")
 	}
-	if depth < 2 {
-		for i, line := range lines {
-			if !strings.HasPrefix(strings.TrimSpace(line), "#EXT-X-STREAM-INF") {
-				continue
-			}
-			for j := i + 1; j < len(lines); j++ {
-				s := strings.TrimSpace(lines[j])
-				if s != "" && !strings.HasPrefix(s, "#") {
-					rel, err := url.Parse(s)
-					if err != nil {
-						return "", err
-					}
-					return fetchAbsolutePlaylist(ctx, client, base.ResolveReference(rel).String(), depth+1)
-				}
-			}
+	if strings.Contains(text, "#EXT-X-STREAM-INF:") {
+		if depth >= 2 {
+			return "", errors.New("master playlist nesting limit exceeded")
 		}
+		variant, err := selectVariant(lines, bandwidthLimit)
+		if err != nil {
+			return "", err
+		}
+		rel, err := url.Parse(variant)
+		if err != nil {
+			return "", err
+		}
+		return fetchAbsolutePlaylist(ctx, client, base.ResolveReference(rel).String(), depth+1, bandwidthLimit)
 	}
 	if err := validateMediaPlaylist(text); err != nil {
 		return "", err

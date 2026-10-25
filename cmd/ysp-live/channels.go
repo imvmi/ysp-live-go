@@ -111,11 +111,13 @@ func stringSet(values ...string) map[string]bool {
 }
 
 type segment struct {
-	Sequence uint64
-	Epoch    uint64
-	Duration float64
-	PDT      string
-	URL      string
+	Sequence      uint64
+	Epoch         uint64
+	SourceEpoch   uint64
+	Discontinuity bool
+	Duration      float64
+	PDT           string
+	URL           string
 }
 
 type channel struct {
@@ -137,7 +139,8 @@ type channel struct {
 	lastMedia     string
 	mode          string
 	bkURLs        []string
-	bkURLsTime    time.Time
+	bkSources     map[string]sourceState
+	bkPreferred   string
 	bkPlaylist    string
 }
 
@@ -155,7 +158,10 @@ type channelManager struct {
 	idleTimeout     time.Duration
 	window          time.Duration
 	maxSegments     int
-	bkURLTTL        time.Duration
+	maxBandwidth    int64
+	hedgeDelay      time.Duration
+	sourceTimeout   time.Duration
+	sourceCooldown  time.Duration
 }
 
 func newChannelManager(client *http.Client) *channelManager {
@@ -169,7 +175,10 @@ func newChannelManager(client *http.Client) *channelManager {
 		idleTimeout:     120 * time.Second,
 		window:          300 * time.Second,
 		maxSegments:     60,
-		bkURLTTL:        300 * time.Second,
+		maxBandwidth:    defaultMaxBandwidth,
+		hedgeDelay:      250 * time.Millisecond,
+		sourceTimeout:   5 * time.Second,
+		sourceCooldown:  10 * time.Second,
 	}
 	for _, spec := range channelSpecs {
 		mode := "jce"
@@ -233,9 +242,23 @@ func (m *channelManager) jceFetch(ctx context.Context, ch *channel) ([]segment, 
 	var result []segment
 	duration := 6.0
 	pdt := ""
+	sourceEpoch := uint64(0)
+	discontinuity := false
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		switch {
+		case strings.HasPrefix(line, "#EXT-X-DISCONTINUITY-SEQUENCE:"):
+			n, err := strconv.ParseUint(strings.TrimPrefix(line, "#EXT-X-DISCONTINUITY-SEQUENCE:"), 10, 64)
+			if err != nil || len(result) > 0 || discontinuity {
+				return nil, errors.New("invalid discontinuity sequence")
+			}
+			sourceEpoch = n
+		case line == "#EXT-X-DISCONTINUITY":
+			if sourceEpoch == math.MaxUint64 {
+				return nil, errors.New("discontinuity sequence overflow")
+			}
+			sourceEpoch++
+			discontinuity = true
 		case strings.HasPrefix(line, "#EXTINF:"):
 			value := strings.TrimPrefix(line, "#EXTINF:")
 			value = strings.SplitN(value, ",", 2)[0]
@@ -251,8 +274,9 @@ func (m *channelManager) jceFetch(ctx context.Context, ch *channel) ([]segment, 
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, segment{Duration: duration, PDT: pdt, URL: base.ResolveReference(rel).String()})
+			result = append(result, segment{Duration: duration, PDT: pdt, URL: base.ResolveReference(rel).String(), SourceEpoch: sourceEpoch, Discontinuity: discontinuity})
 			pdt = ""
+			discontinuity = false
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -286,12 +310,22 @@ func (m *channelManager) mergeSegments(ch *channel, segments []segment) error {
 			lastKnown = i
 		}
 	}
-	epoch := uint64(0)
-	if len(ch.order) > 0 {
-		epoch = ch.segments[ch.order[len(ch.order)-1]].Epoch
-		if lastKnown < 0 {
-			epoch++ // A gap or upstream restart begins a new media timeline.
+	if len(segments) == 0 {
+		return errors.New("empty segment window")
+	}
+	// Anchor local epochs to a retained segment. Upstream discontinuities must
+	// survive refreshes and remain stable when their marker leaves the window.
+	sourceAnchor, localAnchor := segments[0].SourceEpoch, segments[0].SourceEpoch
+	if lastKnown >= 0 {
+		anchor := segments[lastKnown]
+		sourceAnchor = anchor.SourceEpoch
+		localAnchor = ch.segments[segmentKey(anchor.URL, anchor.PDT)].Epoch
+	} else if len(ch.order) > 0 {
+		previous := ch.segments[ch.order[len(ch.order)-1]].Epoch
+		if previous == math.MaxUint64 {
+			return errors.New("discontinuity sequence overflow")
 		}
+		localAnchor = max(localAnchor, previous+1)
 	}
 	if len(segments) > 0 && len(ch.order) > 0 {
 		last := segments[len(segments)-1]
@@ -307,14 +341,33 @@ func (m *channelManager) mergeSegments(ch *channel, segments []segment) error {
 		if next[key] != nil {
 			continue
 		}
+		if item.SourceEpoch >= sourceAnchor {
+			delta := item.SourceEpoch - sourceAnchor
+			if delta > math.MaxUint64-localAnchor {
+				return errors.New("discontinuity sequence overflow")
+			}
+			item.Epoch = localAnchor + delta
+		} else {
+			delta := sourceAnchor - item.SourceEpoch
+			if delta > localAnchor {
+				return errors.New("discontinuity sequence moved backwards")
+			}
+			item.Epoch = localAnchor - delta
+		}
 		if current := ch.segments[key]; current != nil {
-			item.Sequence, item.Epoch = current.Sequence, current.Epoch
+			if item.Epoch != current.Epoch {
+				return errors.New("upstream changed a retained segment's timeline")
+			}
+			item.Sequence = current.Sequence
 		} else {
 			if i < lastKnown {
 				continue // An older segment must not acquire a new sequence number.
 			}
 			nextSequence++
-			item.Sequence, item.Epoch = nextSequence, epoch
+			item.Sequence = nextSequence
+		}
+		if len(order) > 0 && (item.Epoch < next[order[len(order)-1]].Epoch || item.Epoch-next[order[len(order)-1]].Epoch > 1024) {
+			return errors.New("invalid discontinuity jump")
 		}
 		if len(order) > 0 && item.Sequence != next[order[len(order)-1]].Sequence+1 {
 			return errors.New("JCE playlist contains a sequence gap")
@@ -331,73 +384,6 @@ func (m *channelManager) discoverBKURLs(ctx context.Context, ch *channel) ([]str
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	return bkPlayURLs(ctx, m.client, ch.spec.SID, ch.spec.PID, ch.spec.Defn, time.Now())
-}
-
-func (m *channelManager) bkRefresh(ctx context.Context, ch *channel) error {
-	ch.mu.Lock()
-	needURLs := len(ch.bkURLs) == 0 || time.Since(ch.bkURLsTime) > m.bkURLTTL
-	urls := append([]string(nil), ch.bkURLs...)
-	ch.mu.Unlock()
-	if needURLs {
-		fresh, err := m.discoverBKURLs(ctx, ch)
-		if err != nil && len(urls) == 0 {
-			return err
-		}
-		// A discovery outage must not discard still-working CDN candidates.
-		if err == nil {
-			ch.mu.Lock()
-			ch.bkURLs = append([]string(nil), fresh...)
-			ch.bkURLsTime = time.Now()
-			urls = append([]string(nil), fresh...)
-			ch.mu.Unlock()
-			log.Printf("%s bkliveinfo returned %d URLs", ch.spec.Slug, len(urls))
-		}
-	}
-
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		for _, candidate := range urls {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			candidateCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			playlist, err := fetchAbsolutePlaylist(candidateCtx, m.client, candidate, 0)
-			cancel()
-			if err != nil {
-				lastErr = err
-				continue
-			}
-			if !strings.Contains(playlist, "#EXTM3U") {
-				lastErr = errors.New("response is not an M3U8 playlist")
-				continue
-			}
-			ch.mu.Lock()
-			ch.bkPlaylist = playlist
-			ch.lastError = ""
-			ch.mu.Unlock()
-			return nil
-		}
-		if attempt == 0 {
-			fresh, err := m.discoverBKURLs(ctx, ch)
-			if err == nil {
-				urls = fresh
-				ch.mu.Lock()
-				ch.bkURLs = append([]string(nil), fresh...)
-				ch.bkURLsTime = time.Now()
-				ch.mu.Unlock()
-				log.Printf("%s refreshed expired backup URLs", ch.spec.Slug)
-			} else {
-				lastErr = err
-			}
-		}
-	}
-	ch.mu.Lock()
-	ch.bkURLsTime = time.Time{}
-	ch.mu.Unlock()
-	if lastErr == nil {
-		lastErr = errors.New("backup playlist failed")
-	}
-	return lastErr
 }
 
 func (m *channelManager) refreshOnce(ctx context.Context, ch *channel) bool {
@@ -431,7 +417,6 @@ func (m *channelManager) refreshOnce(ctx context.Context, ch *channel) bool {
 			ch.lastMedia, ch.lastProgress = media, time.Now()
 		} else if time.Since(ch.lastProgress) >= m.maxPlaylistAge {
 			err = errors.New("upstream playlist stopped advancing")
-			ch.bkURLsTime = time.Time{} // Rediscover a possibly stalled CDN.
 		}
 	}
 	if err != nil {
@@ -641,12 +626,15 @@ func (m *channelManager) buildPlaylist(ch *channel) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:%d\n", target, items[0].Sequence)
-	fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", items[0].Epoch)
 	epoch := items[0].Epoch
+	if items[0].Discontinuity && epoch > 0 {
+		epoch--
+	}
+	fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", epoch)
 	for _, item := range items {
-		if item.Epoch != epoch {
+		for epoch < item.Epoch {
 			b.WriteString("#EXT-X-DISCONTINUITY\n")
-			epoch = item.Epoch
+			epoch++
 		}
 		if item.PDT != "" {
 			fmt.Fprintf(&b, "#EXT-X-PROGRAM-DATE-TIME:%s\n", item.PDT)
