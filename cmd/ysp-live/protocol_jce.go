@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"reflect"
 	"time"
 )
 
@@ -115,12 +116,13 @@ func (w *jceWriter) emptyList(tag byte) {
 }
 
 type jceReader struct {
-	d []byte
-	p int
+	d     []byte
+	p     int
+	depth int
 }
 
 func (r *jceReader) get(n int) ([]byte, error) {
-	if n < 0 || r.p+n > len(r.d) {
+	if n < 0 || n > len(r.d)-r.p {
 		return nil, io.ErrUnexpectedEOF
 	}
 	b := r.d[r.p : r.p+n]
@@ -174,6 +176,11 @@ func (r *jceReader) fieldValue() (any, error) {
 }
 
 func (r *jceReader) value(typ byte) (any, error) {
+	if r.depth >= 64 {
+		return nil, errors.New("JCE nesting limit exceeded")
+	}
+	r.depth++
+	defer func() { r.depth-- }()
 	switch typ {
 	case 0:
 		b, err := r.u8()
@@ -225,7 +232,7 @@ func (r *jceReader) value(typ byte) (any, error) {
 		return string(b), err
 	case 8:
 		n, err := r.intValue()
-		if err != nil || n < 0 || n > 1_000_000 {
+		if err != nil || n < 0 || n > 1_000_000 || n > int64(len(r.d)-r.p)/2 {
 			return nil, fmt.Errorf("invalid JCE map length %d: %w", n, err)
 		}
 		m := make(map[any]any, n)
@@ -238,12 +245,15 @@ func (r *jceReader) value(typ byte) (any, error) {
 			if err != nil {
 				return nil, err
 			}
+			if k != nil && !reflect.TypeOf(k).Comparable() {
+				return nil, errors.New("invalid JCE map key")
+			}
 			m[k] = v
 		}
 		return m, nil
 	case 9:
 		n, err := r.intValue()
-		if err != nil || n < 0 || n > 1_000_000 {
+		if err != nil || n < 0 || n > 1_000_000 || n > int64(len(r.d)-r.p) {
 			return nil, fmt.Errorf("invalid JCE list length %d: %w", n, err)
 		}
 		items := make([]any, 0, n)
@@ -413,7 +423,7 @@ func unwrapJCE(data []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		payload, err = io.ReadAll(io.LimitReader(zr, 16<<20))
+		payload, err = readLimited(zr, 16<<20)
 		closeErr := zr.Close()
 		if err != nil {
 			return nil, err
@@ -466,7 +476,7 @@ func jceTimeshiftURL(ctx context.Context, client *http.Client, guid, pid, sid st
 	if resp.StatusCode/100 != 2 {
 		return "", fmt.Errorf("jacc returned HTTP %d", resp.StatusCode)
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	raw, err := readLimited(resp.Body, 16<<20)
 	if err != nil {
 		return "", err
 	}

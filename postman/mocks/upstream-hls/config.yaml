@@ -1,0 +1,11 @@
+version: 1
+name: upstream-hls
+slug: upstream-hls
+protocol: http
+port: 4500
+scenarios:
+  - name: default
+    path: ./default.js
+    default: true
+
+interceptRequests: true

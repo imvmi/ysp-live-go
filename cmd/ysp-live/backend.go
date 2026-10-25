@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -23,10 +22,12 @@ type backendManager struct {
 	port   int
 	dir    string
 
+	startMu sync.Mutex // Startup and watchdog may both call Start.
 	mu      sync.Mutex
 	cmd     *exec.Cmd
 	ready   bool
-	logFile *os.File
+	logFile *rotatingLog
+	done    chan struct{}
 	stopped bool
 }
 
@@ -80,10 +81,15 @@ func (b *backendManager) endpoint(path string) string {
 func (b *backendManager) Ready() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.ready && b.cmd != nil && b.cmd.Process != nil && b.cmd.ProcessState == nil
+	return b.ready && b.cmd != nil && b.cmd.Process != nil
 }
 
 func (b *backendManager) Start(ctx context.Context) error {
+	b.startMu.Lock()
+	defer b.startMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if b.path == "" {
 		return nil
 	}
@@ -103,18 +109,22 @@ func (b *backendManager) Start(ctx context.Context) error {
 		b.mu.Unlock()
 		return errors.New("4K backend manager stopped")
 	}
-	if b.cmd != nil && b.cmd.ProcessState == nil {
+	if b.cmd != nil {
 		b.mu.Unlock()
 		if err := b.waitUntilReady(ctx); err != nil {
 			return err
 		}
 		b.mu.Lock()
-		b.ready = true
+		b.ready = !b.stopped && b.cmd != nil
+		ready := b.ready
 		b.mu.Unlock()
+		if !ready {
+			return errors.New("4K backend exited during startup")
+		}
 		return nil
 	}
 	logPath := filepath.Join(b.dir, "ysptp-backend.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	logFile, err := newRotatingLog(logPath, 10<<20, 3)
 	if err != nil {
 		b.mu.Unlock()
 		return err
@@ -125,6 +135,7 @@ func (b *backendManager) Start(ctx context.Context) error {
 		"--device-json", filepath.Join(b.dir, "device-state-rs.json"),
 		"--meta-json", filepath.Join(b.dir, "proxy-cache-state-rs.json"),
 	)
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
@@ -132,6 +143,8 @@ func (b *backendManager) Start(ctx context.Context) error {
 		b.mu.Unlock()
 		return err
 	}
+	done := make(chan struct{})
+	b.done = done
 	b.cmd = cmd
 	b.logFile = logFile
 	b.ready = false
@@ -148,6 +161,7 @@ func (b *backendManager) Start(ctx context.Context) error {
 				b.logFile = nil
 			}
 		}
+		close(done)
 		stopped := b.stopped
 		b.mu.Unlock()
 		if !stopped {
@@ -160,10 +174,12 @@ func (b *backendManager) Start(ctx context.Context) error {
 		return err
 	}
 	b.mu.Lock()
-	if !b.stopped && b.cmd != nil && b.cmd.ProcessState == nil {
-		b.ready = true
-	}
+	b.ready = !b.stopped && b.cmd == cmd
+	ready := b.ready
 	b.mu.Unlock()
+	if !ready {
+		return errors.New("4K backend exited during startup")
+	}
 	log.Printf("4K backend ready")
 	return nil
 }
@@ -172,6 +188,12 @@ func (b *backendManager) waitUntilReady(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
+		b.mu.Lock()
+		alive := !b.stopped && b.cmd != nil
+		b.mu.Unlock()
+		if !alive {
+			return errors.New("4K backend exited during startup")
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, b.endpoint("/4kfifa.m3u"), nil)
 		if err == nil {
 			resp, doErr := b.client.Do(req)
@@ -218,21 +240,24 @@ func (b *backendManager) Stop() {
 	b.mu.Lock()
 	b.stopped = true
 	b.ready = false
-	cmd := b.cmd
+	cmd, done := b.cmd, b.done
 	b.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Signal(os.Interrupt)
-		deadline := time.Now().Add(3 * time.Second)
-		for time.Now().Before(deadline) {
-			b.mu.Lock()
-			exited := b.cmd != cmd || cmd.ProcessState != nil
-			b.mu.Unlock()
-			if exited {
-				return
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Signal(os.Interrupt)
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return
+	case <-timer.C:
 		_ = cmd.Process.Kill()
+	}
+	// WaitDelay also bounds inherited stdout/stderr pipes after process exit.
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
 	}
 }
 
@@ -272,7 +297,7 @@ func (b *backendManager) FetchPlaylist(ctx context.Context, slug, hostHeader str
 	if resp.StatusCode/100 != 2 {
 		return "", fmt.Errorf("4K backend returned HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	body, err := readLimited(resp.Body, 16<<20)
 	if err != nil {
 		return "", err
 	}

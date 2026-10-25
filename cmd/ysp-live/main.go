@@ -59,7 +59,9 @@ func main() {
 	transport.ResponseHeaderTimeout = 20 * time.Second
 	transport.TLSHandshakeTimeout = 10 * time.Second
 	client := &http.Client{Transport: transport, Timeout: 35 * time.Second}
+	defer transport.CloseIdleConnections()
 	channels := newChannelManager(client)
+	defer channels.Close()
 	backend := newBackendManager(client, backendPath, *backendPort, executableDir)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -87,8 +89,11 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
+		channels.Close()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
@@ -99,7 +104,13 @@ func main() {
 	if *bind == "0.0.0.0" || *bind == "::" {
 		log.Printf("warning: service is reachable from other hosts and has no authentication")
 	}
-	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+	serveErr := httpServer.ListenAndServe()
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		log.Printf("HTTP server failed: %v", serveErr)
+		stop()
+	}
+	<-shutdownDone
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		os.Exit(1)
 	}
 }

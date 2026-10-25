@@ -2,11 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -111,6 +112,7 @@ func stringSet(values ...string) map[string]bool {
 
 type segment struct {
 	Sequence uint64
+	Epoch    uint64
 	Duration float64
 	PDT      string
 	URL      string
@@ -125,9 +127,14 @@ type channel struct {
 	sequence      uint64
 	lastAccess    time.Time
 	workerRunning bool
-	starting      bool
+	refreshing    bool
+	updated       chan struct{}
+	wake          chan struct{}
+	nextRetry     time.Time
 	lastError     string
 	lastOK        time.Time
+	lastProgress  time.Time
+	lastMedia     string
 	mode          string
 	bkURLs        []string
 	bkURLsTime    time.Time
@@ -135,6 +142,12 @@ type channel struct {
 }
 
 type channelManager struct {
+	mu              sync.Mutex // Serializes worker registration with Close.
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	stopped         bool
+	maxPlaylistAge  time.Duration
 	client          *http.Client
 	guid            string
 	channels        map[string]*channel
@@ -146,7 +159,9 @@ type channelManager struct {
 }
 
 func newChannelManager(client *http.Client) *channelManager {
+	ctx, cancel := context.WithCancel(context.Background())
 	m := &channelManager{
+		ctx: ctx, cancel: cancel, maxPlaylistAge: 30 * time.Second,
 		client:          client,
 		guid:            newGUID(),
 		channels:        make(map[string]*channel, len(channelSpecs)),
@@ -165,6 +180,8 @@ func newChannelManager(client *http.Client) *channelManager {
 			spec:     spec,
 			segments: make(map[string]*segment),
 			mode:     mode,
+			updated:  make(chan struct{}),
+			wake:     make(chan struct{}, 1),
 		}
 	}
 	return m
@@ -200,7 +217,17 @@ func (m *channelManager) jceFetch(ctx context.Context, ch *channel) ([]segment, 
 	if resp.StatusCode/100 != 2 {
 		return nil, fmt.Errorf("JCE playlist returned HTTP %d", resp.StatusCode)
 	}
-	scanner := bufio.NewScanner(io.LimitReader(resp.Body, 16<<20))
+	body, err := readLimited(resp.Body, 16<<20)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(string(body), "#EXTM3U\n") && !strings.HasPrefix(string(body), "#EXTM3U\r\n") {
+		return nil, errors.New("response is not an M3U8 playlist")
+	}
+	if err := validateMediaPlaylist(string(body)); err != nil {
+		return nil, err
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(body))
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)
 	base := resp.Request.URL
 	var result []segment
@@ -212,9 +239,11 @@ func (m *channelManager) jceFetch(ctx context.Context, ch *channel) ([]segment, 
 		case strings.HasPrefix(line, "#EXTINF:"):
 			value := strings.TrimPrefix(line, "#EXTINF:")
 			value = strings.SplitN(value, ",", 2)[0]
-			if n, err := strconv.ParseFloat(value, 64); err == nil {
-				duration = n
+			n, err := strconv.ParseFloat(value, 64)
+			if err != nil || n <= 0 || math.IsNaN(n) || math.IsInf(n, 0) {
+				return nil, errors.New("invalid JCE segment duration")
 			}
+			duration = n
 		case strings.HasPrefix(line, "#EXT-X-PROGRAM-DATE-TIME:"):
 			pdt = strings.TrimPrefix(line, "#EXT-X-PROGRAM-DATE-TIME:")
 		case line != "" && !strings.HasPrefix(line, "#"):
@@ -240,32 +269,68 @@ func (m *channelManager) jceRefresh(ctx context.Context, ch *channel) error {
 	if err != nil {
 		return err
 	}
+	return m.mergeSegments(ch, segments)
+}
+
+// Reconcile the upstream window, rather than re-adding evicted segments on
+// every poll when a five-minute window contains more than maxSegments items.
+func (m *channelManager) mergeSegments(ch *channel, segments []segment) error {
+	if len(segments) > m.maxSegments {
+		segments = segments[len(segments)-m.maxSegments:]
+	}
 	ch.mu.Lock()
-	added := 0
-	for _, item := range segments {
+	defer ch.mu.Unlock()
+	lastKnown := -1
+	for i, item := range segments {
+		if ch.segments[segmentKey(item.URL, item.PDT)] != nil {
+			lastKnown = i
+		}
+	}
+	epoch := uint64(0)
+	if len(ch.order) > 0 {
+		epoch = ch.segments[ch.order[len(ch.order)-1]].Epoch
+		if lastKnown < 0 {
+			epoch++ // A gap or upstream restart begins a new media timeline.
+		}
+	}
+	if len(segments) > 0 && len(ch.order) > 0 {
+		last := segments[len(segments)-1]
+		if old := ch.segments[segmentKey(last.URL, last.PDT)]; old != nil && old.Sequence < ch.sequence {
+			return errors.New("JCE playlist moved backwards")
+		}
+	}
+	nextSequence := ch.sequence
+	next := make(map[string]*segment, len(segments))
+	order := make([]string, 0, len(segments))
+	for i, item := range segments {
 		key := segmentKey(item.URL, item.PDT)
-		if current := ch.segments[key]; current != nil {
-			current.URL = item.URL
+		if next[key] != nil {
 			continue
 		}
-		ch.sequence++
-		item.Sequence = ch.sequence
+		if current := ch.segments[key]; current != nil {
+			item.Sequence, item.Epoch = current.Sequence, current.Epoch
+		} else {
+			if i < lastKnown {
+				continue // An older segment must not acquire a new sequence number.
+			}
+			nextSequence++
+			item.Sequence, item.Epoch = nextSequence, epoch
+		}
+		if len(order) > 0 && item.Sequence != next[order[len(order)-1]].Sequence+1 {
+			return errors.New("JCE playlist contains a sequence gap")
+		}
 		copyItem := item
-		ch.segments[key] = &copyItem
-		ch.order = append(ch.order, key)
-		added++
+		next[key] = &copyItem
+		order = append(order, key)
 	}
-	for len(ch.order) > m.maxSegments {
-		delete(ch.segments, ch.order[0])
-		ch.order = ch.order[1:]
-	}
-	total := len(ch.segments)
-	ch.lastError = ""
-	ch.mu.Unlock()
-	if added > 0 {
-		log.Printf("%s +%d segments (%d total)", ch.spec.Slug, added, total)
-	}
+	ch.segments, ch.order, ch.sequence = next, order, nextSequence
 	return nil
+}
+
+func (m *channelManager) discoverBKURLs(ctx context.Context, ch *channel) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return bkPlayURLs(ctx, m.client, ch.spec.SID, ch.spec.PID, ch.spec.Defn, time.Now())
 }
 
 func (m *channelManager) bkRefresh(ctx context.Context, ch *channel) error {
@@ -274,22 +339,30 @@ func (m *channelManager) bkRefresh(ctx context.Context, ch *channel) error {
 	urls := append([]string(nil), ch.bkURLs...)
 	ch.mu.Unlock()
 	if needURLs {
-		fresh, err := bkPlayURLs(ctx, m.client, ch.spec.SID, ch.spec.PID, ch.spec.Defn, time.Now())
-		if err != nil {
+		fresh, err := m.discoverBKURLs(ctx, ch)
+		if err != nil && len(urls) == 0 {
 			return err
 		}
-		ch.mu.Lock()
-		ch.bkURLs = append([]string(nil), fresh...)
-		ch.bkURLsTime = time.Now()
-		urls = append([]string(nil), fresh...)
-		ch.mu.Unlock()
-		log.Printf("%s bkliveinfo returned %d URLs", ch.spec.Slug, len(urls))
+		// A discovery outage must not discard still-working CDN candidates.
+		if err == nil {
+			ch.mu.Lock()
+			ch.bkURLs = append([]string(nil), fresh...)
+			ch.bkURLsTime = time.Now()
+			urls = append([]string(nil), fresh...)
+			ch.mu.Unlock()
+			log.Printf("%s bkliveinfo returned %d URLs", ch.spec.Slug, len(urls))
+		}
 	}
 
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		for _, candidate := range urls {
-			playlist, err := fetchAbsolutePlaylist(ctx, m.client, candidate, 0)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			candidateCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			playlist, err := fetchAbsolutePlaylist(candidateCtx, m.client, candidate, 0)
+			cancel()
 			if err != nil {
 				lastErr = err
 				continue
@@ -305,7 +378,7 @@ func (m *channelManager) bkRefresh(ctx context.Context, ch *channel) error {
 			return nil
 		}
 		if attempt == 0 {
-			fresh, err := bkPlayURLs(ctx, m.client, ch.spec.SID, ch.spec.PID, ch.spec.Defn, time.Now())
+			fresh, err := m.discoverBKURLs(ctx, ch)
 			if err == nil {
 				urls = fresh
 				ch.mu.Lock()
@@ -347,6 +420,20 @@ func (m *channelManager) refreshOnce(ctx context.Context, ch *channel) bool {
 	}
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
+	if err == nil {
+		media := ""
+		if ch.mode == "bk" {
+			media = playlistMediaKey(ch.bkPlaylist)
+		} else if len(ch.order) > 0 {
+			media = ch.order[len(ch.order)-1]
+		}
+		if media != ch.lastMedia || ch.lastProgress.IsZero() {
+			ch.lastMedia, ch.lastProgress = media, time.Now()
+		} else if time.Since(ch.lastProgress) >= m.maxPlaylistAge {
+			err = errors.New("upstream playlist stopped advancing")
+			ch.bkURLsTime = time.Time{} // Rediscover a possibly stalled CDN.
+		}
+	}
 	if err != nil {
 		ch.lastError = truncateError(err, 120)
 		log.Printf("%s refresh failed: %s", ch.spec.Slug, ch.lastError)
@@ -365,23 +452,51 @@ func truncateError(err error, limit int) string {
 	return s
 }
 
+// Close cancels both in-flight upstream requests and sleeping refresh workers.
+func (m *channelManager) Close() {
+	m.mu.Lock()
+	m.stopped = true
+	m.cancel()
+	m.mu.Unlock()
+	m.wg.Wait()
+}
+
+// Caller holds ch.mu. A nonempty cache alone does not imply playable media.
+func (m *channelManager) freshLocked(ch *channel) bool {
+	hasData := len(ch.order) > 0
+	if ch.mode == "bk" {
+		hasData = ch.bkPlaylist != ""
+	}
+	ageLimit := m.maxPlaylistAge
+	if ch.mode == "bk" {
+		if target := playlistTargetDuration(ch.bkPlaylist); target > 0 && 2*target < ageLimit {
+			ageLimit = 2 * target
+		}
+	}
+	return hasData && !ch.lastOK.IsZero() && time.Since(ch.lastOK) < ageLimit &&
+		!ch.lastProgress.IsZero() && time.Since(ch.lastProgress) < m.maxPlaylistAge
+}
+
 func (m *channelManager) refreshLoop(ch *channel) {
-	defer func() {
-		ch.mu.Lock()
-		ch.workerRunning = false
-		ch.mu.Unlock()
-	}()
+	defer m.wg.Done()
 	log.Printf("%s background refresh started", ch.spec.Slug)
 	failures := 0
 	for {
 		ch.mu.Lock()
-		lastAccess := ch.lastAccess
-		ch.mu.Unlock()
-		if time.Since(lastAccess) >= m.idleTimeout {
-			log.Printf("%s idle; stopping refresh", ch.spec.Slug)
+		if m.ctx.Err() != nil || time.Since(ch.lastAccess) >= m.idleTimeout {
+			// The access check and ownership release must be atomic with ensure.
+			ch.workerRunning = false
+			ch.mu.Unlock()
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		ch.refreshing = true
+		// A wake queued before this refresh is already satisfied by this attempt.
+		select {
+		case <-ch.wake:
+		default:
+		}
+		ch.mu.Unlock()
+		ctx, cancel := context.WithTimeout(m.ctx, 35*time.Second)
 		ok := m.refreshOnce(ctx, ch)
 		cancel()
 		if ok {
@@ -393,44 +508,115 @@ func (m *channelManager) refreshLoop(ch *channel) {
 		if failures >= 3 {
 			delay = 30 * time.Second
 		}
-		time.Sleep(delay)
+		ch.mu.Lock()
+		if ok && ch.mode == "bk" {
+			// Short live windows need polling at the upstream segment cadence.
+			if target := playlistTargetDuration(ch.bkPlaylist); target > 0 && target < delay {
+				delay = target
+			}
+		}
+		ch.refreshing = false
+		ch.nextRetry = time.Now().Add(delay)
+		close(ch.updated)
+		ch.updated = make(chan struct{})
+		ch.mu.Unlock()
+		timer := time.NewTimer(delay)
+		select {
+		case <-m.ctx.Done():
+		case <-timer.C:
+		case <-ch.wake:
+		}
+		timer.Stop()
 	}
 }
 
-func (m *channelManager) ensure(ch *channel) {
-	now := time.Now()
-	ch.mu.Lock()
-	ch.lastAccess = now
-	if ch.starting {
-		ch.mu.Unlock()
-		return
+func playlistMediaKey(playlist string) string {
+	sequence, lastURI := "", ""
+	for _, line := range strings.Split(playlist, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:") {
+			sequence = line
+		}
+		if line != "" && !strings.HasPrefix(line, "#") {
+			lastURI = segmentKey(line, "")
+		}
 	}
-	needFetch := len(ch.segments) == 0 && ch.bkPlaylist == ""
-	needWorker := !ch.workerRunning
-	if !needFetch && !needWorker {
-		ch.mu.Unlock()
-		return
-	}
-	ch.starting = true
-	ch.mu.Unlock()
+	return sequence + "|" + lastURI
+}
 
-	if needFetch {
-		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
-		m.refreshOnce(ctx, ch)
-		cancel()
+func playlistTargetDuration(playlist string) time.Duration {
+	for _, line := range strings.Split(playlist, "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "#EXT-X-TARGETDURATION:"); ok {
+			if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 && seconds <= 3600 {
+				return time.Duration(seconds) * time.Second
+			}
+		}
+	}
+	return 0
+}
+
+func (m *channelManager) ensure(ctx context.Context, ch *channel) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		return context.Canceled
 	}
 	ch.mu.Lock()
-	if needWorker && !ch.workerRunning {
+	ch.lastAccess = time.Now()
+	started := !ch.workerRunning
+	if started {
 		ch.workerRunning = true
+		ch.nextRetry = time.Time{}
+		m.wg.Add(1)
 		go m.refreshLoop(ch)
 	}
-	ch.starting = false
+	m.mu.Unlock()
+	if m.freshLocked(ch) {
+		ch.mu.Unlock()
+		return nil
+	}
+	if !started && !ch.refreshing && time.Now().Before(ch.nextRetry) && ch.lastError != "" {
+		err := errors.New(ch.lastError)
+		ch.mu.Unlock()
+		return err
+	}
+	updated := ch.updated
+	if !started && !ch.refreshing {
+		select {
+		case ch.wake <- struct{}{}:
+		default:
+		}
+	}
 	ch.mu.Unlock()
+	// All callers wait for the same worker; cancelling one client must not
+	// cancel a shared refresh needed by other viewers.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-m.ctx.Done():
+		return m.ctx.Err()
+	case <-updated:
+	}
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	if m.freshLocked(ch) {
+		return nil
+	}
+	if ch.lastError != "" {
+		return errors.New(ch.lastError)
+	}
+	return errors.New("playlist is stale")
 }
 
 func (m *channelManager) buildPlaylist(ch *channel) string {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
+	if !m.freshLocked(ch) {
+		return ""
+	}
 	if ch.mode == "bk" {
 		return ch.bkPlaylist
 	}
@@ -455,7 +641,13 @@ func (m *channelManager) buildPlaylist(ch *channel) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:%d\n", target, items[0].Sequence)
+	fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", items[0].Epoch)
+	epoch := items[0].Epoch
 	for _, item := range items {
+		if item.Epoch != epoch {
+			b.WriteString("#EXT-X-DISCONTINUITY\n")
+			epoch = item.Epoch
+		}
 		if item.PDT != "" {
 			fmt.Fprintf(&b, "#EXT-X-PROGRAM-DATE-TIME:%s\n", item.PDT)
 		}
@@ -465,10 +657,13 @@ func (m *channelManager) buildPlaylist(ch *channel) string {
 }
 
 type channelDiagnostic struct {
-	Slug      string
-	Mode      string
-	LastOK    time.Time
-	LastError string
+	Slug          string
+	Mode          string
+	LastOK        time.Time
+	LastError     string
+	WorkerRunning bool
+	Fresh         bool
+	LastProgress  time.Time
 }
 
 func (m *channelManager) diagnostics() []channelDiagnostic {
@@ -476,7 +671,7 @@ func (m *channelManager) diagnostics() []channelDiagnostic {
 	for _, spec := range channelSpecs {
 		ch := m.channels[spec.Slug]
 		ch.mu.Lock()
-		result = append(result, channelDiagnostic{Slug: spec.Slug, Mode: ch.mode, LastOK: ch.lastOK, LastError: ch.lastError})
+		result = append(result, channelDiagnostic{Slug: spec.Slug, Mode: ch.mode, LastOK: ch.lastOK, LastError: ch.lastError, WorkerRunning: ch.workerRunning, Fresh: m.freshLocked(ch), LastProgress: ch.lastProgress})
 		ch.mu.Unlock()
 	}
 	return result

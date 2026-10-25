@@ -1,0 +1,6 @@
+simulation: hls-recovery
+routing: path
+mocks:
+  - name: upstream-hls
+    routeKey: upstream
+    path: postman/mocks/upstream-hls/config.yaml

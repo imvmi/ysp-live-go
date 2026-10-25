@@ -59,7 +59,7 @@ func newAppServer(channels *channelManager, backend *backendManager, bind string
 		bind:     bind,
 		port:     port,
 		index:    template.Must(template.New("index").Parse(indexTemplate)),
-		gala:     newGalaResolver(http.DefaultClient),
+		gala:     newGalaResolver(channels.client),
 	}
 }
 
@@ -145,7 +145,11 @@ func (s *appServer) serveDiagnostics(w http.ResponseWriter) {
 		if !item.LastOK.IsZero() {
 			age = fmt.Sprintf("%d秒前", int(now.Sub(item.LastOK).Seconds()))
 		}
-		fmt.Fprintf(&body, "%s mode=%s 最后成功=%s err=%s\n", item.Slug, item.Mode, age, item.LastError)
+		progress := "从未更新"
+		if !item.LastProgress.IsZero() {
+			progress = fmt.Sprintf("%d秒前", int(now.Sub(item.LastProgress).Seconds()))
+		}
+		fmt.Fprintf(&body, "%s mode=%s 最后成功=%s 分片更新=%s worker=%t fresh=%t err=%s\n", item.Slug, item.Mode, age, progress, item.WorkerRunning, item.Fresh, item.LastError)
 	}
 	s.write(w, http.StatusOK, "text/plain; charset=utf-8", []byte(body.String()))
 }
@@ -157,7 +161,7 @@ func (s *appServer) serveChannel(w http.ResponseWriter, r *http.Request, slug st
 		return
 	}
 	if s.backend != nil && backendChannels[slug] && s.backend.Ready() {
-		ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 		playlist, err := s.backend.FetchPlaylist(ctx, slug, r.Host)
 		cancel()
 		if err == nil {
@@ -166,16 +170,22 @@ func (s *appServer) serveChannel(w http.ResponseWriter, r *http.Request, slug st
 		}
 		log.Printf("4K %s fetch failed, falling back: %v", slug, err)
 	}
-	s.channels.ensure(ch)
+	ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
+	err := s.channels.ensure(ctx, ch)
+	cancel()
 	playlist := s.channels.buildPlaylist(ch)
 	if playlist == "" {
 		ch.mu.Lock()
 		lastError := ch.lastError
 		ch.mu.Unlock()
+		if lastError == "" && err != nil {
+			lastError = truncateError(err, 120)
+		}
 		if lastError == "" {
 			lastError = "正在拉取"
 		}
 		msg := fmt.Sprintf("频道 %s 暂无数据（%s），请稍后重试\n", ch.spec.Name, lastError)
+		w.Header().Set("Retry-After", "3")
 		s.write(w, http.StatusServiceUnavailable, "text/plain; charset=utf-8", []byte(msg))
 		return
 	}

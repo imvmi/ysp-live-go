@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -199,7 +198,7 @@ func (g *galaResolver) resolve(ctx context.Context, source galaSource) (string, 
 	if resp.StatusCode/100 != 2 {
 		return "", fmt.Errorf("playvinfo returned HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	body, err := readLimited(resp.Body, 4<<20)
 	if err != nil {
 		return "", err
 	}
@@ -219,7 +218,10 @@ func (g *galaResolver) resolve(ctx context.Context, source galaSource) (string, 
 			continue
 		}
 		media := strings.TrimRight(base.String(), "/") + "/" + video.File
-		mu, _ := url.Parse(media)
+		mu, err := url.Parse(media)
+		if err != nil {
+			continue
+		}
 		params := url.Values{"vkey": {video.VKey}, "guid": {guid}, "sdtfrom": {gala8Platform}, "platform": {"2"}}
 		mu.RawQuery = params.Encode()
 		return mu.String(), nil

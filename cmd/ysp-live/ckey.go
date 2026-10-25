@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -324,7 +326,11 @@ func bkPlayURLs(ctx context.Context, client *http.Client, channelID, livePID, de
 		return nil, fmt.Errorf("bkliveinfo returned HTTP %d", resp.StatusCode)
 	}
 	var payload map[string]any
-	dec := json.NewDecoder(io.LimitReader(resp.Body, 8<<20))
+	body, err := readLimited(resp.Body, 8<<20)
+	if err != nil {
+		return nil, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	if err := dec.Decode(&payload); err != nil {
 		return nil, err
@@ -399,13 +405,16 @@ func fetchAbsolutePlaylist(ctx context.Context, client *http.Client, rawURL stri
 	if resp.StatusCode/100 != 2 {
 		return "", fmt.Errorf("playlist returned HTTP %d", resp.StatusCode)
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	b, err := readLimited(resp.Body, 16<<20)
 	if err != nil {
 		return "", err
 	}
 	text := strings.ReplaceAll(string(b), "\r\n", "\n")
 	base := resp.Request.URL
 	lines := strings.Split(text, "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "#EXTM3U" {
+		return "", errors.New("response is not an M3U8 playlist")
+	}
 	if depth < 2 {
 		for i, line := range lines {
 			if !strings.HasPrefix(strings.TrimSpace(line), "#EXT-X-STREAM-INF") {
@@ -423,6 +432,9 @@ func fetchAbsolutePlaylist(ctx context.Context, client *http.Client, rawURL stri
 			}
 		}
 	}
+	if err := validateMediaPlaylist(text); err != nil {
+		return "", err
+	}
 	for i, line := range lines {
 		s := strings.TrimSpace(line)
 		if s == "" {
@@ -439,4 +451,32 @@ func fetchAbsolutePlaylist(ctx context.Context, client *http.Client, rawURL stri
 		lines[i] = base.ResolveReference(rel).String()
 	}
 	return strings.Join(lines, "\n"), nil
+}
+
+// A 200 response with a header alone, a nested master, or a truncated segment
+// entry is not playable and must not refresh the cache's success timestamp.
+func validateMediaPlaylist(text string) error {
+	pending, found := false, false
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#EXT-X-STREAM-INF:") {
+			return errors.New("unresolved master playlist")
+		}
+		if value, ok := strings.CutPrefix(line, "#EXTINF:"); ok {
+			duration, err := strconv.ParseFloat(strings.SplitN(value, ",", 2)[0], 64)
+			if pending || err != nil || duration <= 0 || math.IsNaN(duration) || math.IsInf(duration, 0) {
+				return errors.New("invalid segment duration")
+			}
+			pending = true
+		} else if line != "" && !strings.HasPrefix(line, "#") {
+			if !pending {
+				return errors.New("media URI without duration")
+			}
+			pending, found = false, true
+		}
+	}
+	if pending || !found {
+		return errors.New("empty or incomplete media playlist")
+	}
+	return nil
 }
