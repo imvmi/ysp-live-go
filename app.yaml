@@ -1,0 +1,20 @@
+runtime: go127
+service: default
+main: ./cmd/ysp-live
+
+instance_class: F1
+
+automatic_scaling:
+  min_instances: 0
+  max_instances: 1
+  max_concurrent_requests: 1000
+
+env_variables:
+  YSP_ACCESS_TOKEN_SHA256: "0ce4c7323b9005c8f502e54eb40b84c983e6d1119122b7ca398ee38740b31be8"
+  YSP_PUBLIC_BASE_URL: "https://gae-20261026-dot-default-dot-my-second-project-208211.df.r.appspot.com"
+
+handlers:
+  - url: /.*
+    secure: always
+    redirect_http_response_code: 301
+    script: auto

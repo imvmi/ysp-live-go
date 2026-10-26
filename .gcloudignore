@@ -1,0 +1,12 @@
+.gcloudignore
+.git
+.gitignore
+.DS_Store
+coverage.out
+dist/
+postman/
+*.test
+**/*_test.go
+ysptp-backend.log*
+device-state-rs.json
+proxy-cache-state-rs.json

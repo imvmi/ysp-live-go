@@ -19,8 +19,16 @@ import (
 const version = "0.1.0"
 
 func main() {
-	bind := flag.String("bind", "127.0.0.1", "监听地址；局域网共享可设为 0.0.0.0")
-	port := flag.Int("port", 8767, "HTTP 服务端口")
+	defaultPort, err := environmentPort()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defaultBind := "127.0.0.1"
+	if os.Getenv("PORT") != "" || os.Getenv("GAE_ENV") == "standard" {
+		defaultBind = "0.0.0.0"
+	}
+	bind := flag.String("bind", defaultBind, "监听地址；局域网共享可设为 0.0.0.0")
+	port := flag.Int("port", defaultPort, "HTTP 服务端口")
 	backendFlag := flag.String("backend", "", "4K 后端路径；使用 auto 自动寻找；留空则禁用")
 	backendPort := flag.Int("backend-port", 8766, "4K 后端端口")
 	maxBandwidth := flag.Int64("max-bandwidth", defaultMaxBandwidth, "多码率直播选择上限（bit/s）；0 选择最高码率")
@@ -84,6 +92,12 @@ func main() {
 	}
 
 	app := newAppServer(channels, backend, *bind, *port)
+	if err := app.configureAccessTokenHash(os.Getenv("YSP_ACCESS_TOKEN_SHA256")); err != nil {
+		log.Fatal(err)
+	}
+	if err := app.configurePublicBaseURL(os.Getenv("YSP_PUBLIC_BASE_URL")); err != nil {
+		log.Fatal(err)
+	}
 	httpServer := &http.Server{
 		Addr:              net.JoinHostPort(*bind, strconv.Itoa(*port)),
 		Handler:           app,
@@ -106,7 +120,12 @@ func main() {
 	}()
 
 	log.Printf("ysp-live-go %s: %d channels, listening on http://%s/", version, len(channelSpecs), httpServer.Addr)
-	if *bind == "0.0.0.0" || *bind == "::" {
+	if len(app.accessTokenHash) > 0 {
+		log.Printf("access token protection enabled")
+	} else {
+		log.Printf("warning: access token protection is disabled")
+	}
+	if (*bind == "0.0.0.0" || *bind == "::") && len(app.accessTokenHash) == 0 {
 		log.Printf("warning: service is reachable from other hosts and has no authentication")
 	}
 	serveErr := httpServer.ListenAndServe()
@@ -118,4 +137,16 @@ func main() {
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 		os.Exit(1)
 	}
+}
+
+func environmentPort() (int, error) {
+	raw := os.Getenv("PORT")
+	if raw == "" {
+		return 8767, nil
+	}
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("invalid PORT %q", raw)
+	}
+	return port, nil
 }

@@ -5,20 +5,20 @@ import (
 	"fmt"
 	"html/template"
 	"log"
-	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
 
 type appServer struct {
-	channels *channelManager
-	backend  *backendManager
-	gala     *galaResolver
-	port     int
-	bind     string
-	index    *template.Template
+	channels        *channelManager
+	backend         *backendManager
+	gala            *galaResolver
+	port            int
+	bind            string
+	index           *template.Template
+	publicBaseURL   string
+	accessTokenHash []byte
 }
 
 type indexChannel struct {
@@ -32,6 +32,7 @@ type indexData struct {
 	BackendReady bool
 	Channels     []indexChannel
 	VODs         []indexVOD
+	TokenQuery   string
 }
 
 type indexVOD struct {
@@ -47,9 +48,9 @@ const indexTemplate = `<!DOCTYPE html>
 </head><body>
 <h2>央视频全频道直播（{{.Count}} 路{{if .BackendReady}}，含真 4K{{end}}）</h2>
 <p>将链接粘贴到播放器即可观看。普通频道的分片由播放器直连央视 CDN；设备协议频道可能经本地后端中继。</p>
-<p>聚合订阅：<a href="/all.m3u">/all.m3u</a></p>
+<p>聚合订阅：<a href="/all.m3u{{.TokenQuery}}">/all.m3u</a></p>
 <h3>历届春晚点播</h3><ul>{{range .VODs}}<li><a href="{{.Path}}">{{.Name}}</a></li>{{end}}</ul>
-<ul>{{range .Channels}}<li><a href="/{{.Slug}}.m3u8">{{.Name}}</a>{{if .Tag}} <span class="tag">[{{.Tag}}]</span>{{end}} <span class="path">/{{.Slug}}.m3u8</span></li>{{end}}</ul>
+<ul>{{range .Channels}}<li><a href="/{{.Slug}}.m3u8{{$.TokenQuery}}">{{.Name}}</a>{{if .Tag}} <span class="tag">[{{.Tag}}]</span>{{end}} <span class="path">/{{.Slug}}.m3u8</span></li>{{end}}</ul>
 </body></html>`
 
 func newAppServer(channels *channelManager, backend *backendManager, bind string, port int) *appServer {
@@ -66,28 +67,22 @@ func newAppServer(channels *channelManager, backend *backendManager, bind string
 func (s *appServer) write(w http.ResponseWriter, status int, contentType string, body []byte) {
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Cache-Control", "no-cache")
+	if len(s.accessTokenHash) > 0 {
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+	} else {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	_, _ = w.Write(body)
 }
 
-func (s *appServer) publicHost(r *http.Request) string {
-	host := advertisedHost(r.Host)
-	if host == "" {
-		host = s.bind
-		if host == "0.0.0.0" || host == "::" || host == "" {
-			host = "127.0.0.1"
-		}
-	}
-	return net.JoinHostPort(host, strconv.Itoa(s.port))
-}
-
-func (s *appServer) serveIndex(w http.ResponseWriter) {
+func (s *appServer) serveIndex(w http.ResponseWriter, r *http.Request) {
 	ready := s.backend != nil && s.backend.Ready()
-	data := indexData{Count: len(channelSpecs), BackendReady: ready}
+	data := indexData{Count: len(channelSpecs), BackendReady: ready, TokenQuery: s.tokenQuery(r)}
 	for _, source := range galaSources {
-		data.VODs = append(data.VODs, indexVOD{Name: source.Name, Path: "/vod/spring-gala/" + source.Slug + ".mp4"})
+		data.VODs = append(data.VODs, indexVOD{Name: source.Name, Path: "/vod/spring-gala/" + source.Slug + ".mp4" + data.TokenQuery})
 	}
 	for _, spec := range channelSpecs {
 		tag := ""
@@ -107,14 +102,13 @@ func (s *appServer) serveIndex(w http.ResponseWriter) {
 }
 
 func (s *appServer) serveAllM3U(w http.ResponseWriter, r *http.Request) {
-	host := s.publicHost(r)
 	var body strings.Builder
 	body.WriteString("#EXTM3U\n")
 	for _, spec := range channelSpecs {
-		fmt.Fprintf(&body, "#EXTINF:-1 group-title=\"%s\",%s\nhttp://%s/%s.m3u8\n", channelGroup(spec), spec.Name, host, spec.Slug)
+		fmt.Fprintf(&body, "#EXTINF:-1 group-title=\"%s\",%s\n%s\n", channelGroup(spec), spec.Name, s.publicURL(r, "/"+spec.Slug+".m3u8"))
 	}
 	for _, source := range galaSources {
-		fmt.Fprintf(&body, "#EXTINF:-1 group-title=\"春晚\",%s\nhttp://%s/vod/spring-gala/%s.mp4\n", source.Name, host, source.Slug)
+		fmt.Fprintf(&body, "#EXTINF:-1 group-title=\"春晚\",%s\n%s\n", source.Name, s.publicURL(r, "/vod/spring-gala/"+source.Slug+".mp4"))
 	}
 	s.write(w, http.StatusOK, "application/vnd.apple.mpegurl", []byte(body.String()))
 }
@@ -205,11 +199,17 @@ func (s *appServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Path
+	if path == "/health" {
+		s.write(w, http.StatusOK, "text/plain; charset=utf-8", []byte("ok\n"))
+		return
+	}
+	if !s.authorized(r) {
+		s.write(w, http.StatusForbidden, "text/plain; charset=utf-8", []byte("forbidden\n"))
+		return
+	}
 	switch path {
 	case "/", "/index.html":
-		s.serveIndex(w)
-	case "/health":
-		s.write(w, http.StatusOK, "text/plain; charset=utf-8", []byte("ok\n"))
+		s.serveIndex(w, r)
 	case "/all.m3u":
 		s.serveAllM3U(w, r)
 	case "/diag":

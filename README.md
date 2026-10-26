@@ -140,6 +140,29 @@ go vet ./...
 
 后端默认使用 `8766` 端口，可通过 `-backend-port` 修改。该后端是独立的外部二进制，不包含在本项目中；启用前请自行确认其来源和行为。
 
+## Google App Engine Standard
+
+`app.yaml` 部署到 App Engine `default` 服务，使用 Go 1.27、F1 实例，允许缩容到零并限制最多一个实例。App Engine Standard 不支持本地 4K 子进程，因此部署时保持 4K 后端禁用。
+
+除 `/health` 外的路由需要 `token` 查询参数。配置中只保存 token 的 SHA-256 摘要，不保存原文。更换 token 时生成新值并更新 `app.yaml` 中的 `YSP_ACCESS_TOKEN_SHA256`：
+
+```bash
+TOKEN="$(openssl rand -hex 32)"
+printf '%s' "$TOKEN" | shasum -a 256
+```
+
+部署前还需要将 `YSP_PUBLIC_BASE_URL` 设为实际对外 HTTPS 地址，然后执行：
+
+```bash
+gcloud app deploy app.yaml --project PROJECT_ID
+```
+
+播放器聚合订阅地址为：
+
+```text
+https://YOUR_HOST/all.m3u?token=YOUR_TOKEN
+```
+
 ## 项目结构
 
 ```text
