@@ -149,7 +149,9 @@ func (s *appServer) serveDiagnostics(w http.ResponseWriter) {
 		if !item.LastProgress.IsZero() {
 			progress = fmt.Sprintf("%d秒前", int(now.Sub(item.LastProgress).Seconds()))
 		}
-		fmt.Fprintf(&body, "%s mode=%s 最后成功=%s 分片更新=%s worker=%t fresh=%t err=%s\n", item.Slug, item.Mode, age, progress, item.WorkerRunning, item.Fresh, item.LastError)
+		fmt.Fprintf(&body, "%s mode=%s source=%s 最后成功=%s 分片更新=%s refresh_ms=%d rate_limited=%d worker=%t fresh=%t err=%s\n",
+			item.Slug, item.Mode, item.SourceHost, age, progress, item.LastRefresh.Milliseconds(), item.RateLimited,
+			item.WorkerRunning, item.Fresh, item.LastError)
 	}
 	s.write(w, http.StatusOK, "text/plain; charset=utf-8", []byte(body.String()))
 }

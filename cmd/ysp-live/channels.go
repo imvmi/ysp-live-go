@@ -54,9 +54,9 @@ var channelSpecs = []channelSpec{
 	{"cgtnar", "CGTN阿拉伯语", "2024182001", "600084782", "fhd"},
 	{"cgtnes", "CGTN西班牙语", "2024182101", "600084744", "fhd"},
 	{"cgtndoc", "CGTN 纪录", "2024182301", "600084781", "fhd"},
-	{"cctvfyjc", "CCTV 风云剧场", "2025637103", "600099658", "shd"},
-	{"cctvdyjc", "CCTV 第一剧场", "2026874203", "600099655", "shd"},
-	{"cctvhjjc", "CCTV 怀旧剧场", "2026874303", "600099620", "shd"},
+	{"cctvfyjc", "CCTV 风云剧场", "2025637102", "600099658", "shd"},
+	{"cctvdyjc", "CCTV 第一剧场", "2026874202", "600099655", "shd"},
+	{"cctvhjjc", "CCTV 怀旧剧场", "2026874302", "600099620", "shd"},
 	{"bjws", "北京卫视", "2024052703", "600002309", "fhd"},
 	{"jsws", "江苏卫视", "2024171103", "600002521", "fhd"},
 	{"dfws", "东方卫视", "2024054503", "600002483", "fhd"},
@@ -87,7 +87,8 @@ var channelSpecs = []channelSpec{
 	{"shanxiws", "山西卫视", "2025560803", "600190407", "fhd"},
 	{"qhws", "青海卫视", "2025559103", "600190406", "fhd"},
 	{"xizangws", "西藏卫视", "2025558003", "600190403", "fhd"},
-	{"xjws", "新疆卫视", "2019927403", "600152138", "fhd"},
+	{"gsws", "甘肃卫视", "2025561703", "600190408", "fhd"},
+	{"xjws", "新疆卫视", "2050898603", "600152138", "fhd"},
 	{"cetv1", "CETV-1", "2022823801", "600171827", "fhd"},
 	{"guoxue", "国学频道", "2029360403", "600213139", "fhd"},
 }
@@ -138,6 +139,9 @@ type channel struct {
 	lastProgress  time.Time
 	lastMedia     string
 	mode          string
+	nextBKProbe   time.Time
+	lastRefresh   time.Duration
+	rateLimited   uint64
 	bkURLs        []string
 	bkSources     map[string]sourceState
 	bkPreferred   string
@@ -162,6 +166,15 @@ type channelManager struct {
 	hedgeDelay      time.Duration
 	sourceTimeout   time.Duration
 	sourceCooldown  time.Duration
+	bkRetryInterval time.Duration
+	bkGateMu        sync.Mutex
+	bkNext          time.Time
+	bkInterval      time.Duration
+	bkSlots         chan struct{}
+	jceMu           sync.Mutex
+	jceNext         time.Time
+	jceInterval     time.Duration
+	jceSlots        chan struct{}
 }
 
 func newChannelManager(client *http.Client) *channelManager {
@@ -172,28 +185,73 @@ func newChannelManager(client *http.Client) *channelManager {
 		guid:            newGUID(),
 		channels:        make(map[string]*channel, len(channelSpecs)),
 		refreshInterval: 10 * time.Second,
-		idleTimeout:     120 * time.Second,
+		idleTimeout:     30 * time.Second,
 		window:          300 * time.Second,
 		maxSegments:     60,
 		maxBandwidth:    defaultMaxBandwidth,
 		hedgeDelay:      250 * time.Millisecond,
-		sourceTimeout:   5 * time.Second,
+		sourceTimeout:   4 * time.Second,
 		sourceCooldown:  10 * time.Second,
+		bkRetryInterval: 30 * time.Second,
+		bkInterval:      700 * time.Millisecond,
+		bkSlots:         make(chan struct{}, 1),
+		jceInterval:     500 * time.Millisecond,
+		jceSlots:        make(chan struct{}, 2),
 	}
 	for _, spec := range channelSpecs {
-		mode := "jce"
-		if forceBK[spec.Slug] {
-			mode = "bk"
-		}
 		m.channels[spec.Slug] = &channel{
 			spec:     spec,
 			segments: make(map[string]*segment),
-			mode:     mode,
+			mode:     "bk",
 			updated:  make(chan struct{}),
 			wake:     make(chan struct{}, 1),
 		}
 	}
 	return m
+}
+
+func acquireRateSlot(ctx context.Context, mu *sync.Mutex, next *time.Time, interval time.Duration, slots chan struct{}) (func(), error) {
+	select {
+	case slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	release := func() { <-slots }
+
+	mu.Lock()
+	now := time.Now()
+	ready := *next
+	if ready.Before(now) {
+		ready = now
+	}
+	*next = ready.Add(interval)
+	mu.Unlock()
+	if delay := time.Until(ready); delay > 0 {
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			release()
+			return nil, ctx.Err()
+		}
+	}
+	return release, nil
+}
+
+// Both discovery APIs are process-wide rate limited. A player that probes many
+// channels must not turn each channel worker into an independent request burst.
+func (m *channelManager) acquireJCE(ctx context.Context) (func(), error) {
+	return acquireRateSlot(ctx, &m.jceMu, &m.jceNext, m.jceInterval, m.jceSlots)
+}
+
+func (m *channelManager) acquireBK(ctx context.Context) (func(), error) {
+	return acquireRateSlot(ctx, &m.bkGateMu, &m.bkNext, m.bkInterval, m.bkSlots)
 }
 
 func segmentKey(rawURL, pdt string) string {
@@ -209,7 +267,12 @@ func segmentKey(rawURL, pdt string) string {
 
 func (m *channelManager) jceFetch(ctx context.Context, ch *channel) ([]segment, error) {
 	now := time.Now()
+	release, err := m.acquireJCE(ctx)
+	if err != nil {
+		return nil, err
+	}
 	playlistURL, err := jceTimeshiftURL(ctx, m.client, m.guid, ch.spec.PID, ch.spec.SID, now.Add(-m.window).Unix(), now.Unix(), ch.spec.Defn)
+	release()
 	if err != nil {
 		return nil, err
 	}
@@ -381,31 +444,76 @@ func (m *channelManager) mergeSegments(ch *channel, segments []segment) error {
 }
 
 func (m *channelManager) discoverBKURLs(ctx context.Context, ch *channel) ([]string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	release, err := m.acquireBK(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	return bkPlayURLs(ctx, m.client, ch.spec.SID, ch.spec.PID, ch.spec.Defn, time.Now())
+	return bkPlayURLs(requestCtx, m.client, ch.spec.SID, ch.spec.PID, ch.spec.Defn, time.Now())
 }
 
 func (m *channelManager) refreshOnce(ctx context.Context, ch *channel) bool {
+	started := time.Now()
 	ch.mu.Lock()
 	mode := ch.mode
+	nextBKProbe := ch.nextBKProbe
 	ch.mu.Unlock()
 	var err error
 	if mode == "bk" {
 		err = m.bkRefresh(ctx, ch)
+		if err != nil && !forceBK[ch.spec.Slug] && ctx.Err() == nil {
+			bkErr := err
+			err = m.jceRefresh(ctx, ch)
+			if err == nil {
+				ch.mu.Lock()
+				ch.mode = "jce"
+				ch.nextBKProbe = time.Now().Add(m.bkRetryInterval)
+				ch.mu.Unlock()
+			} else {
+				err = fmt.Errorf("BK: %v; JCE: %w", bkErr, err)
+			}
+		}
 	} else {
-		err = m.jceRefresh(ctx, ch)
-		var dead *deadHostError
-		if errors.As(err, &dead) {
-			ch.mu.Lock()
-			ch.mode = "bk"
-			ch.mu.Unlock()
-			log.Printf("%s JCE returned dead host; switching to bkliveinfo", ch.spec.Slug)
+		bkTried := false
+		if !nextBKProbe.IsZero() && !time.Now().Before(nextBKProbe) {
+			bkTried = true
 			err = m.bkRefresh(ctx, ch)
+			ch.mu.Lock()
+			ch.nextBKProbe = time.Now().Add(m.bkRetryInterval)
+			if err == nil {
+				ch.mode = "bk"
+				ch.nextBKProbe = time.Time{}
+			}
+			ch.mu.Unlock()
+		}
+		if err != nil || nextBKProbe.IsZero() || time.Now().Before(nextBKProbe) {
+			err = m.jceRefresh(ctx, ch)
+		}
+		if err != nil && ctx.Err() == nil {
+			jceErr := err
+			if bkTried {
+				return m.finishRefresh(ch, started, fmt.Errorf("JCE: %w", jceErr))
+			}
+			if bkErr := m.bkRefresh(ctx, ch); bkErr == nil {
+				ch.mu.Lock()
+				ch.mode = "bk"
+				ch.nextBKProbe = time.Time{}
+				ch.mu.Unlock()
+				err = nil
+			} else {
+				err = fmt.Errorf("JCE: %v; BK: %w", jceErr, bkErr)
+			}
 		}
 	}
+	return m.finishRefresh(ch, started, err)
+}
+
+func (m *channelManager) finishRefresh(ch *channel, started time.Time, err error) bool {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
+	ch.lastRefresh = time.Since(started)
 	if err == nil {
 		media := ""
 		if ch.mode == "bk" {
@@ -421,6 +529,9 @@ func (m *channelManager) refreshOnce(ctx context.Context, ch *channel) bool {
 	}
 	if err != nil {
 		ch.lastError = truncateError(err, 120)
+		if strings.Contains(err.Error(), "操作过于频繁") {
+			ch.rateLimited++
+		}
 		log.Printf("%s refresh failed: %s", ch.spec.Slug, ch.lastError)
 		return false
 	}
@@ -647,8 +758,11 @@ func (m *channelManager) buildPlaylist(ch *channel) string {
 type channelDiagnostic struct {
 	Slug          string
 	Mode          string
+	SourceHost    string
 	LastOK        time.Time
 	LastError     string
+	LastRefresh   time.Duration
+	RateLimited   uint64
 	WorkerRunning bool
 	Fresh         bool
 	LastProgress  time.Time
@@ -659,7 +773,25 @@ func (m *channelManager) diagnostics() []channelDiagnostic {
 	for _, spec := range channelSpecs {
 		ch := m.channels[spec.Slug]
 		ch.mu.Lock()
-		result = append(result, channelDiagnostic{Slug: spec.Slug, Mode: ch.mode, LastOK: ch.lastOK, LastError: ch.lastError, WorkerRunning: ch.workerRunning, Fresh: m.freshLocked(ch), LastProgress: ch.lastProgress})
+		sourceURL := ch.bkPreferred
+		if sourceURL == "" && len(ch.bkURLs) > 0 {
+			sourceURL = ch.bkURLs[0]
+		}
+		if ch.mode == "jce" && len(ch.order) > 0 {
+			if item := ch.segments[ch.order[len(ch.order)-1]]; item != nil {
+				sourceURL = item.URL
+			}
+		}
+		sourceHost := ""
+		if parsed, err := url.Parse(sourceURL); err == nil {
+			sourceHost = parsed.Hostname()
+		}
+		result = append(result, channelDiagnostic{
+			Slug: spec.Slug, Mode: ch.mode, SourceHost: sourceHost,
+			LastOK: ch.lastOK, LastError: ch.lastError, LastRefresh: ch.lastRefresh,
+			RateLimited: ch.rateLimited, WorkerRunning: ch.workerRunning,
+			Fresh: m.freshLocked(ch), LastProgress: ch.lastProgress,
+		})
 		ch.mu.Unlock()
 	}
 	return result

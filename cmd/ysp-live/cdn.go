@@ -140,7 +140,7 @@ func (m *channelManager) fetchBKCandidates(ctx context.Context, ch *channel) err
 			requestCtx, stop := context.WithTimeout(workCtx, m.sourceTimeout)
 			defer stop()
 			playlist, err := fetchAbsolutePlaylist(requestCtx, m.client, u, 0, m.maxBandwidth)
-			results <- playlistResult{u, playlist, err}
+			results <- playlistResult{url: u, playlist: playlist, err: err}
 		}()
 	}
 	start()

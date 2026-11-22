@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,6 +53,8 @@ func testManager(t *testing.T, upstream string) (*channelManager, *channel) {
 	t.Cleanup(transport.CloseIdleConnections)
 	m := newChannelManager(&http.Client{Transport: &testRoutingTransport{u, transport}, Timeout: 2 * time.Second})
 	m.refreshInterval = time.Hour
+	m.bkInterval = 0
+	m.jceInterval = 0
 	t.Cleanup(m.Close)
 	ch := m.channels["cctv11"]
 	ch.bkURLs = []string{"https://bklive-test.ysp.cctv.cn/live.m3u8"}
@@ -248,10 +251,103 @@ func TestIdleWorkerCanRestart(t *testing.T) {
 	}
 }
 
+func TestProductionDefaultsPreferBKAndLimitJCE(t *testing.T) {
+	m := newChannelManager(http.DefaultClient)
+	defer m.Close()
+	if m.idleTimeout != 30*time.Second || m.bkInterval != 700*time.Millisecond || cap(m.bkSlots) != 1 || m.jceInterval != 500*time.Millisecond || cap(m.jceSlots) != 2 {
+		t.Fatalf("idle=%s BK=%s/%d JCE=%s/%d", m.idleTimeout, m.bkInterval, cap(m.bkSlots), m.jceInterval, cap(m.jceSlots))
+	}
+	for slug, ch := range m.channels {
+		if ch.mode != "bk" {
+			t.Fatalf("%s starts in %s mode", slug, ch.mode)
+		}
+	}
+}
+
+func TestCurrentChannelIDs(t *testing.T) {
+	want := map[string]string{
+		"cctvfyjc": "2025637102",
+		"cctvdyjc": "2026874202",
+		"cctvhjjc": "2026874302",
+		"gsws":     "2025561703",
+		"xjws":     "2050898603",
+	}
+	for _, spec := range channelSpecs {
+		if sid, ok := want[spec.Slug]; ok {
+			if spec.SID != sid {
+				t.Fatalf("%s SID=%s", spec.Slug, spec.SID)
+			}
+			delete(want, spec.Slug)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing channels: %v", want)
+	}
+}
+
+func TestJCEGateSpacesRequests(t *testing.T) {
+	m := newChannelManager(http.DefaultClient)
+	defer m.Close()
+	m.jceInterval = 25 * time.Millisecond
+	m.jceSlots = make(chan struct{}, 3)
+	times := make(chan time.Time, 3)
+	for i := 0; i < cap(times); i++ {
+		go func() {
+			release, err := m.acquireJCE(context.Background())
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			times <- time.Now()
+			release()
+		}()
+	}
+	observed := make([]time.Time, 0, cap(times))
+	for i := 0; i < cap(times); i++ {
+		observed = append(observed, <-times)
+	}
+	sort.Slice(observed, func(i, j int) bool { return observed[i].Before(observed[j]) })
+	for i := 1; i < len(observed); i++ {
+		if gap := observed[i].Sub(observed[i-1]); gap < 15*time.Millisecond {
+			t.Fatalf("JCE requests only %s apart", gap)
+		}
+	}
+}
+
+func TestBKGateSpacesRequests(t *testing.T) {
+	m := newChannelManager(http.DefaultClient)
+	defer m.Close()
+	m.bkInterval = 25 * time.Millisecond
+	m.bkSlots = make(chan struct{}, 3)
+	times := make(chan time.Time, 3)
+	for i := 0; i < cap(times); i++ {
+		go func() {
+			release, err := m.acquireBK(context.Background())
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			times <- time.Now()
+			release()
+		}()
+	}
+	observed := make([]time.Time, 0, cap(times))
+	for i := 0; i < cap(times); i++ {
+		observed = append(observed, <-times)
+	}
+	sort.Slice(observed, func(i, j int) bool { return observed[i].Before(observed[j]) })
+	for i := 1; i < len(observed); i++ {
+		if gap := observed[i].Sub(observed[i-1]); gap < 15*time.Millisecond {
+			t.Fatalf("BK requests only %s apart", gap)
+		}
+	}
+}
+
 func TestSegmentWindowRemainsBoundedAndOrdered(t *testing.T) {
 	m := newChannelManager(http.DefaultClient)
 	defer m.Close()
 	ch := m.channels["cctv1"]
+	ch.mode = "jce"
 	makeSegments := func(start int) []segment {
 		items := make([]segment, 100)
 		for i := range items {
@@ -341,59 +437,69 @@ func TestHungUpstreamRespectsClientTimeout(t *testing.T) {
 	}
 }
 
-func TestJCERefreshAndFallbackOverHTTP(t *testing.T) {
-	for _, fallback := range []bool{false, true} {
-		t.Run(fmt.Sprint("fallback=", fallback), func(t *testing.T) {
-			playlistURL := "https://bklive-test.ysp.cctv.cn/live.m3u8"
-			if fallback {
-				playlistURL = "https://liverecord.video.cloud.cctv.com/live.m3u8"
-			}
-			body := &jceWriter{}
-			body.integer(0, 0)
-			body.str(playlistURL, 2)
-			packet, err := wrapJCE(pidTimeShift, body.b, 1, strings.Repeat("a", 32))
-			if err != nil {
-				t.Fatal(err)
-			}
-			var jceCalls, cdnCalls atomic.Int32
+func jceResponsePacket(t *testing.T, playlistURL string) []byte {
+	t.Helper()
+	body := &jceWriter{}
+	body.integer(0, 0)
+	body.str(playlistURL, 2)
+	packet, err := wrapJCE(pidTimeShift, body.b, 1, strings.Repeat("a", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return packet
+}
+
+func TestBKIsPreferredAndJCEIsFallback(t *testing.T) {
+	packet := jceResponsePacket(t, "https://jce-test.cctv.cn/live.m3u8")
+	for _, tc := range []struct {
+		name        string
+		startMode   string
+		bkFails     bool
+		jceFails    bool
+		wantMode    string
+		wantJCECall int32
+	}{
+		{name: "BK preferred", startMode: "bk", wantMode: "bk"},
+		{name: "BK falls back to JCE", startMode: "bk", bkFails: true, wantMode: "jce", wantJCECall: 1},
+		{name: "JCE returns to BK", startMode: "jce", jceFails: true, wantMode: "bk", wantJCECall: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var jceCalls atomic.Int32
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.Header.Get("X-Upstream-Host") {
 				case "jacc.ysp.cctv.cn":
 					jceCalls.Add(1)
-					if r.Method != "POST" {
-						t.Error("JCE request is not POST")
+					if tc.jceFails {
+						http.Error(w, "unavailable", 503)
+						return
 					}
 					_, _ = io.Copy(io.Discard, r.Body)
 					_, _ = w.Write(packet)
 				case "bkliveinfo.ysp.cctv.cn":
+					if tc.bkFails {
+						http.Error(w, "unavailable", 503)
+						return
+					}
 					_, _ = io.WriteString(w, `{"iretcode":0,"playurl":"https://bklive-test.ysp.cctv.cn/live.m3u8"}`)
 				default:
-					cdnCalls.Add(1)
 					_, _ = io.WriteString(w, testPlaylist)
 				}
 			}))
 			defer upstream.Close()
-			m, _ := testManager(t, upstream.URL)
-			ch := m.channels["cctv1"]
-			if err := m.mergeSegments(ch, []segment{{URL: "https://old.invalid/expired.ts", Duration: 6}}); err != nil {
-				t.Fatal(err)
-			}
-			ch.lastOK = time.Now().Add(-180 * 24 * time.Hour)
+			m, ch := testManager(t, upstream.URL)
+			ch = m.channels["cctv1"]
+			ch.mode = tc.startMode
 			if err := m.ensure(context.Background(), ch); err != nil {
 				t.Fatal(err)
 			}
-			playlist := m.buildPlaylist(ch)
-			if !strings.Contains(playlist, "fresh.ts") || strings.Contains(playlist, "expired.ts") {
+			if playlist := m.buildPlaylist(ch); !strings.Contains(playlist, "fresh.ts") {
 				t.Fatal(playlist)
-			}
-			if jceCalls.Load() != 1 || cdnCalls.Load() != 1 {
-				t.Fatalf("calls: JCE=%d CDN=%d", jceCalls.Load(), cdnCalls.Load())
 			}
 			ch.mu.Lock()
 			mode := ch.mode
 			ch.mu.Unlock()
-			if (mode == "bk") != fallback {
-				t.Fatalf("mode=%s", mode)
+			if mode != tc.wantMode || jceCalls.Load() != tc.wantJCECall {
+				t.Fatalf("mode=%s JCE calls=%d", mode, jceCalls.Load())
 			}
 		})
 	}
