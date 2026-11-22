@@ -17,6 +17,8 @@ type playlistTimeline struct {
 	last, lastEpoch       uint64
 	boundary              uint64
 	lastStart             uint64
+	lastInputEpoch        uint64
+	identities            map[uint64]string
 	switched              bool
 }
 
@@ -67,10 +69,30 @@ func (t *playlistTimeline) normalize(text, source string) string {
 	if p.count == 0 {
 		return ""
 	}
+	identities := make(map[uint64]string, p.count)
+	inputIndex := p.sequence
+	byteRange := ""
+	conflict := false
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#EXT-X-BYTERANGE:") {
+			byteRange = line
+		}
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		identity := segmentKey(line, "") + "|" + byteRange
+		identities[inputIndex] = identity
+		if old, ok := t.identities[inputIndex]; ok && old != identity {
+			conflict = true
+		}
+		inputIndex++
+		byteRange = ""
+	}
 	if t.source == "" {
 		t.source, t.inputBase, t.outputBase = source, p.sequence, p.sequence
 		t.epochIn, t.epochOut = p.epoch, p.epoch
-	} else if t.source != source || p.sequence < t.lastStart || p.epoch < t.epochIn {
+	} else if t.source != source || p.sequence < t.lastStart || p.epoch < t.lastInputEpoch || conflict {
 		t.source, t.inputBase, t.outputBase = source, p.sequence, t.last+1
 		t.epochIn, t.epochOut = p.epoch, t.lastEpoch+1
 		t.boundary, t.switched = p.sequence, true
@@ -119,6 +141,8 @@ func (t *playlistTimeline) normalize(text, source string) string {
 	}
 	t.last = seq + p.count - 1
 	t.lastStart = p.sequence
+	t.lastInputEpoch = p.epoch
+	t.identities = identities
 	t.lastEpoch = epoch
 	return out.String()
 }

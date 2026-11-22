@@ -18,6 +18,8 @@ import (
 
 const browserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 
+var errUnsupportedJCE = errors.New("unsupported JCE media format")
+
 type channelSpec struct {
 	Slug string
 	Name string
@@ -311,6 +313,15 @@ func (m *channelManager) jceFetch(ctx context.Context, ch *channel) ([]segment, 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		switch {
+		case strings.HasPrefix(line, "#EXT-X-KEY:"):
+			attrs, err := playlistAttributes(strings.TrimPrefix(line, "#EXT-X-KEY:"))
+			if err != nil || attrs["METHOD"] != "NONE" {
+				return nil, fmt.Errorf("%w: EXT-X-KEY", errUnsupportedJCE)
+			}
+		case strings.HasPrefix(line, "#EXT-X-MAP:"), strings.HasPrefix(line, "#EXT-X-BYTERANGE:"), line == "#EXT-X-GAP", line == "#EXT-X-I-FRAMES-ONLY":
+			// The JCE reconciler currently stores complete unencrypted TS
+			// segments. Dropping decoding/range metadata would emit broken media.
+			return nil, fmt.Errorf("%w: %s", errUnsupportedJCE, strings.SplitN(line, ":", 2)[0])
 		case strings.HasPrefix(line, "#EXT-X-DISCONTINUITY-SEQUENCE:"):
 			n, err := strconv.ParseUint(strings.TrimPrefix(line, "#EXT-X-DISCONTINUITY-SEQUENCE:"), 10, 64)
 			if err != nil || len(result) > 0 || discontinuity {
@@ -613,6 +624,7 @@ func (m *channelManager) refreshLoop(ch *channel) {
 		default:
 		}
 		ch.mu.Unlock()
+		refreshStarted := time.Now()
 		ctx, cancel := context.WithTimeout(m.ctx, 75*time.Second)
 		ok := m.refreshOnce(ctx, ch)
 		cancel()
@@ -631,6 +643,9 @@ func (m *channelManager) refreshLoop(ch *channel) {
 			if target := playlistTargetDuration(ch.bkPlaylist); target > 0 && target < delay {
 				delay = target
 			}
+			// Schedule from request start, so network time does not accumulate
+			// on top of the segment cadence. Keep a floor for slow upstreams.
+			delay = max(100*time.Millisecond, delay-time.Since(refreshStarted))
 		}
 		ch.refreshing = false
 		ch.nextRetry = time.Now().Add(delay)
