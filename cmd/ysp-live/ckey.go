@@ -455,7 +455,7 @@ func fetchAbsolutePlaylist(ctx context.Context, client *http.Client, rawURL stri
 // A 200 response with a header alone, a nested master, or a truncated segment
 // entry is not playable and must not refresh the cache's success timestamp.
 func validateMediaPlaylist(text string) error {
-	pending, found := false, false
+	pending, found, gap := false, false, false
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "#EXT-X-ENDLIST" {
@@ -463,6 +463,9 @@ func validateMediaPlaylist(text string) error {
 		}
 		if strings.HasPrefix(line, "#EXT-X-STREAM-INF:") {
 			return errors.New("unresolved master playlist")
+		}
+		if line == "#EXT-X-GAP" {
+			gap = true
 		}
 		if value, ok := strings.CutPrefix(line, "#EXTINF:"); ok {
 			duration, err := strconv.ParseFloat(strings.SplitN(value, ",", 2)[0], 64)
@@ -474,7 +477,8 @@ func validateMediaPlaylist(text string) error {
 			if !pending {
 				return errors.New("media URI without duration")
 			}
-			pending, found = false, true
+			found = found || !gap
+			pending, gap = false, false
 		}
 	}
 	if pending || !found {

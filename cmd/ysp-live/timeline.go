@@ -92,7 +92,10 @@ func (t *playlistTimeline) normalize(text, source string) string {
 	if t.source == "" {
 		t.source, t.inputBase, t.outputBase = source, p.sequence, p.sequence
 		t.epochIn, t.epochOut = p.epoch, p.epoch
-	} else if t.source != source || p.sequence < t.lastStart || p.epoch < t.lastInputEpoch || conflict {
+	} else if t.source != source || p.sequence < t.lastStart || p.epoch < t.lastInputEpoch || conflict ||
+		(p.epoch > t.lastInputEpoch && p.sequence >= t.lastStart+uint64(len(t.identities))) {
+		// A discontinuity can already have slid out of a disjoint new
+		// window. Emit a visible boundary for viewers of the old window.
 		t.source, t.inputBase, t.outputBase = source, p.sequence, t.last+1
 		t.epochIn, t.epochOut = p.epoch, t.lastEpoch+1
 		t.boundary, t.switched = p.sequence, true

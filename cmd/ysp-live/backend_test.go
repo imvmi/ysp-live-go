@@ -27,6 +27,7 @@ func TestMain(m *testing.M) {
 		}
 		mux := http.NewServeMux()
 		var unhealthy atomic.Bool
+		unhealthy.Store(os.Getenv("YSP_TEST_BACKEND_UNREADY") == "1")
 		mux.HandleFunc("/4kfifa.m3u", func(w http.ResponseWriter, r *http.Request) {
 			if unhealthy.Load() {
 				w.WriteHeader(503)

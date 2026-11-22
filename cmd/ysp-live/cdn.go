@@ -12,10 +12,12 @@ import (
 const maxCDNCandidates = 16
 
 type sourceState struct {
-	RetryAfter   time.Time
-	LastMedia    string
-	LastProgress time.Time
-	Error        string
+	RetryAfter    time.Time
+	LastMedia     string
+	LastProgress  time.Time
+	Error         string
+	ResetPosition playlistPosition
+	ResetObserved time.Time
 }
 
 type playlistResult struct {
@@ -40,8 +42,13 @@ func (m *channelManager) setBKURLs(ch *channel, urls []string) {
 			// Renewing a signature may fix authorization, but must not make
 			// a known frozen media timeline appear to advance again.
 			for oldURL, old := range ch.bkSources {
-				if segmentKey(oldURL, "") == segmentKey(u, "") && old.LastProgress.After(state.LastProgress) {
-					state.LastMedia, state.LastProgress = old.LastMedia, old.LastProgress
+				if segmentKey(oldURL, "") == segmentKey(u, "") {
+					if old.LastProgress.After(state.LastProgress) {
+						state.LastMedia, state.LastProgress = old.LastMedia, old.LastProgress
+					}
+					if old.ResetObserved.After(state.ResetObserved) {
+						state.ResetPosition, state.ResetObserved = old.ResetPosition, old.ResetObserved
+					}
 				}
 			}
 		}
@@ -67,11 +74,25 @@ func (m *channelManager) acceptBKSource(ch *channel, result playlistResult) erro
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	now := time.Now()
+	state := ch.bkSources[result.url]
 	if ch.bkPlaylist != "" && playlistMovedBackwards(ch.bkPlaylist, result.playlist) {
-		return errors.New("BK playlist moved backwards")
+		old, next := mediaPosition(ch.bkPlaylist), mediaPosition(result.playlist)
+		// A restarted encoder may reset its sequence counter. Once the old
+		// timeline is stale, require two progressing observations of the same
+		// candidate before accepting a reset. Explicit old wall-clock media
+		// remains stale regardless of sequence movement.
+		previous := state.ResetPosition
+		canReset := !ch.bkLastProgress.IsZero() && now.Sub(ch.bkLastProgress) >= m.maxPlaylistAge &&
+			!state.ResetObserved.IsZero() && now.Sub(state.ResetObserved) <= 2*m.maxPlaylistAge &&
+			next.sequence >= previous.sequence && next.sequence+next.count > previous.sequence+previous.count &&
+			(old.lastTime.IsZero() || next.lastTime.IsZero() || next.lastTime.After(old.lastTime))
+		state.ResetPosition, state.ResetObserved = next, now
+		ch.bkSources[result.url] = state
+		if !canReset {
+			return errors.New("BK playlist moved backwards")
+		}
 	}
 	media := playlistMediaKey(result.playlist)
-	state := ch.bkSources[result.url]
 	// Check both this source's history and the last served playlist. A source
 	// that returns 200 with frozen media must not win the candidate race.
 	if (media == state.LastMedia && !state.LastProgress.IsZero() && now.Sub(state.LastProgress) >= m.maxPlaylistAge) ||
@@ -82,8 +103,12 @@ func (m *channelManager) acceptBKSource(ch *channel, result playlistResult) erro
 		state.LastMedia, state.LastProgress = media, now
 	}
 	state.RetryAfter, state.Error = time.Time{}, ""
+	state.ResetPosition, state.ResetObserved = playlistPosition{}, time.Time{}
 	ch.bkSources[result.url] = state
 	ch.bkPreferred = result.url
+	if media != playlistMediaKey(ch.bkPlaylist) || ch.bkLastProgress.IsZero() {
+		ch.bkLastProgress = now
+	}
 	ch.bkPlaylist = result.playlist
 	return nil
 }

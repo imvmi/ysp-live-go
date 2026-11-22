@@ -126,29 +126,31 @@ type segment struct {
 type channel struct {
 	spec channelSpec
 
-	mu            sync.Mutex
-	segments      map[string]*segment
-	order         []string
-	sequence      uint64
-	lastAccess    time.Time
-	workerRunning bool
-	refreshing    bool
-	updated       chan struct{}
-	wake          chan struct{}
-	nextRetry     time.Time
-	lastError     string
-	lastOK        time.Time
-	lastProgress  time.Time
-	lastMedia     string
-	mode          string
-	nextBKProbe   time.Time
-	lastRefresh   time.Duration
-	rateLimited   uint64
-	bkURLs        []string
-	bkSources     map[string]sourceState
-	bkPreferred   string
-	bkPlaylist    string
-	output        playlistTimeline
+	mu             sync.Mutex
+	segments       map[string]*segment
+	order          []string
+	sequence       uint64
+	lastAccess     time.Time
+	workerRunning  bool
+	starting       bool
+	refreshing     bool
+	updated        chan struct{}
+	wake           chan struct{}
+	nextRetry      time.Time
+	lastError      string
+	lastOK         time.Time
+	lastProgress   time.Time
+	lastMedia      string
+	mode           string
+	nextBKProbe    time.Time
+	lastRefresh    time.Duration
+	rateLimited    uint64
+	bkURLs         []string
+	bkSources      map[string]sourceState
+	bkPreferred    string
+	bkPlaylist     string
+	bkLastProgress time.Time
+	output         playlistTimeline
 }
 
 type channelManager struct {
@@ -419,6 +421,9 @@ func (m *channelManager) mergeSegments(ch *channel, segments []segment) error {
 	order := make([]string, 0, len(segments))
 	for i, item := range segments {
 		key := segmentKey(item.URL, item.PDT)
+		if i == 0 && lastKnown < 0 && len(ch.order) > 0 {
+			item.Discontinuity = true
+		}
 		if next[key] != nil {
 			continue
 		}
@@ -440,6 +445,7 @@ func (m *channelManager) mergeSegments(ch *channel, segments []segment) error {
 				return errors.New("upstream changed a retained segment's timeline")
 			}
 			item.Sequence = current.Sequence
+			item.Discontinuity = item.Discontinuity || current.Discontinuity
 		} else {
 			if i < lastKnown {
 				continue // An older segment must not acquire a new sequence number.
@@ -482,7 +488,7 @@ func (m *channelManager) refreshOnce(ctx context.Context, ch *channel) bool {
 	tryBK := func(probe bool) error {
 		budget := 8 * time.Second
 		ch.mu.Lock()
-		cold := ch.lastOK.IsZero()
+		cold := ch.lastOK.IsZero() || (ch.starting && !m.freshLocked(ch))
 		ch.mu.Unlock()
 		if cold {
 			budget = 60 * time.Second
@@ -648,6 +654,7 @@ func (m *channelManager) refreshLoop(ch *channel) {
 			delay = max(100*time.Millisecond, delay-time.Since(refreshStarted))
 		}
 		ch.refreshing = false
+		ch.starting = false
 		ch.nextRetry = time.Now().Add(delay)
 		close(ch.updated)
 		ch.updated = make(chan struct{})
@@ -701,6 +708,7 @@ func (m *channelManager) ensure(ctx context.Context, ch *channel) error {
 	started := !ch.workerRunning
 	if started {
 		ch.workerRunning = true
+		ch.starting = true
 		ch.nextRetry = time.Time{}
 		m.wg.Add(1)
 		go m.refreshLoop(ch)

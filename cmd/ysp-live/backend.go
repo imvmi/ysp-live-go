@@ -129,8 +129,10 @@ func (b *backendManager) Start(ctx context.Context) error {
 		return errors.New("4K backend manager stopped")
 	}
 	if b.cmd != nil {
+		cmd, done := b.cmd, b.done
 		b.mu.Unlock()
 		if err := b.waitUntilReady(ctx); err != nil {
+			b.reapFailedStartup(cmd, done)
 			return err
 		}
 		b.mu.Lock()
@@ -193,6 +195,7 @@ func (b *backendManager) Start(ctx context.Context) error {
 
 	log.Printf("4K backend starting: %s", b.path)
 	if err := b.waitUntilReady(ctx); err != nil {
+		b.reapFailedStartup(cmd, done)
 		return err
 	}
 	b.mu.Lock()
@@ -207,6 +210,25 @@ func (b *backendManager) Start(ctx context.Context) error {
 	}
 	log.Printf("4K backend ready")
 	return nil
+}
+
+// A startup deadline must not leave an unready child occupying the slot
+// forever. Cleanup uses its own bounded wait because startup's context has
+// normally already expired. Stop and the process waiter may run concurrently.
+func (b *backendManager) reapFailedStartup(cmd *exec.Cmd, done <-chan struct{}) {
+	b.mu.Lock()
+	ownsUnready := b.cmd == cmd && !b.ready
+	b.mu.Unlock()
+	if !ownsUnready || cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Kill()
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
 }
 
 func (b *backendManager) waitUntilReady(ctx context.Context) error {
