@@ -21,6 +21,26 @@ mkdir -p dist
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o dist/ysp-live-linux-arm64 ./cmd/ysp-live
 ```
 
+## GitHub Release 自动发布
+
+将包含 `.github/workflows/release.yml` 的提交推送到 GitHub 后，推送任意新 tag
+会触发测试、竞态检查及交叉编译，并自动创建对应的 GitHub Release。例如：
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+Release 附件包含：
+
+- `ysp-live-linux-amd64`：Linux x64，无 CGO 依赖。
+- `ysp-live-windows-amd64.exe`：Windows x64。
+- `SHA256SUMS`：上述文件的 SHA-256 校验值。
+
+二进制的 `-version` 显示 tag 名称。工作流使用仓库自带的 `GITHUB_TOKEN`，
+无需额外配置 Secret；附件上传完成后才发布新 Release。构建内容为 tag 指向的
+提交，不会自动部署服务，也不包含可选的第三方 4K 后端。
+
 ## 运行
 
 默认监听 `127.0.0.1:8767`：

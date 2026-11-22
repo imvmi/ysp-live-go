@@ -16,7 +16,8 @@ import (
 	"time"
 )
 
-const version = "0.1.0"
+// Release builds inject the Git tag with -ldflags "-X=main.version=...".
+var version = "0.1.0"
 
 func main() {
 	bind := flag.String("bind", "127.0.0.1", "监听地址；局域网共享可设为 0.0.0.0")

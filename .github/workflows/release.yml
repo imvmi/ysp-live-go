@@ -1,0 +1,76 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - '**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Only new tags, not branch pushes, tag deletion or moving an existing tag.
+    if: github.event.created && !github.event.deleted
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: stable
+          cache: false # Standard-library-only project; no go.sum.
+
+      - name: Test and vet
+        run: |
+          go vet ./...
+          go test -race ./... -count=1
+
+      - name: Build Linux and Windows x64
+        env:
+          CGO_ENABLED: '0'
+          GOARCH: amd64
+        run: |
+          mkdir -p dist
+          GOOS=linux go build -trimpath -ldflags "-s -w -X=main.version=$RELEASE_TAG" \
+            -o dist/ysp-live-linux-amd64 ./cmd/ysp-live
+          GOOS=windows go build -trimpath -ldflags "-s -w -X=main.version=$RELEASE_TAG" \
+            -o dist/ysp-live-windows-amd64.exe ./cmd/ysp-live
+          test "$(./dist/ysp-live-linux-amd64 -version)" = "$RELEASE_TAG"
+          cd dist
+          sha256sum ysp-live-linux-amd64 ysp-live-windows-amd64.exe > SHA256SUMS
+
+      - name: Upload and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            echo "Updating assets for existing release: $RELEASE_TAG"
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes --title "$RELEASE_TAG"
+            draft=true
+          fi
+          gh release upload "$RELEASE_TAG" \
+            dist/ysp-live-linux-amd64 \
+            dist/ysp-live-windows-amd64.exe \
+            dist/SHA256SUMS --clobber
+          if [[ "$draft" == true ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false
+          fi
