@@ -458,6 +458,9 @@ func validateMediaPlaylist(text string) error {
 	pending, found := false, false
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
+		if line == "#EXT-X-ENDLIST" {
+			return errors.New("live playlist has ended")
+		}
 		if strings.HasPrefix(line, "#EXT-X-STREAM-INF:") {
 			return errors.New("unresolved master playlist")
 		}

@@ -6,9 +6,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -24,7 +26,15 @@ func TestMain(m *testing.M) {
 			}
 		}
 		mux := http.NewServeMux()
-		mux.HandleFunc("/4kfifa.m3u", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+		var unhealthy atomic.Bool
+		mux.HandleFunc("/4kfifa.m3u", func(w http.ResponseWriter, r *http.Request) {
+			if unhealthy.Load() {
+				w.WriteHeader(503)
+				return
+			}
+			w.WriteHeader(200)
+		})
+		mux.HandleFunc("/fail-health", func(w http.ResponseWriter, r *http.Request) { unhealthy.Store(true) })
 		mux.HandleFunc("/exit", func(w http.ResponseWriter, r *http.Request) { os.Exit(0) })
 		fmt.Println("test backend started")
 		if err := http.ListenAndServe(net.JoinHostPort("127.0.0.1", port), mux); err != nil {
@@ -79,6 +89,23 @@ func TestBackendConcurrentStartExitAndStop(t *testing.T) {
 	if !b.Ready() {
 		t.Fatal("backend not ready")
 	}
+	b.mu.Lock()
+	originalPID := b.cmd.Process.Pid
+	b.mu.Unlock()
+	failed, err := b.client.Get(b.endpoint("/fail-health"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed.Body.Close()
+	if err := b.maintain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	restartedPID := b.cmd.Process.Pid
+	b.mu.Unlock()
+	if originalPID == restartedPID || !b.Ready() {
+		t.Fatal("unresponsive child was not restarted")
+	}
 	resp, _ := b.client.Get(b.endpoint("/exit"))
 	if resp != nil {
 		_, _ = io.Copy(io.Discard, resp.Body)
@@ -94,5 +121,43 @@ func TestBackendConcurrentStartExitAndStop(t *testing.T) {
 	}
 	if err := b.Start(ctx); err == nil {
 		t.Fatal("backend restarted after Stop")
+	}
+}
+
+func TestBackendFailureCooldownAndRecovery(t *testing.T) {
+	var calls atomic.Int32
+	var broken atomic.Bool
+	broken.Store(true)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if broken.Load() {
+			<-r.Context().Done()
+			return
+		}
+		_, _ = io.WriteString(w, testPlaylist)
+	}))
+	defer upstream.Close()
+	m, _ := testManager(t, upstream.URL)
+	b := newBackendManager(m.client, "", 8766, t.TempDir())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	_, err := b.FetchPlaylist(ctx, "cctv1", "localhost")
+	cancel()
+	if err == nil {
+		t.Fatal("hung backend succeeded")
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := b.FetchPlaylist(context.Background(), "cctv1", "localhost"); err == nil {
+			t.Fatal("cooldown bypassed")
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("retried unavailable backend %d times", calls.Load())
+	}
+	broken.Store(false)
+	b.mu.Lock()
+	b.retryAfter = time.Now().Add(-time.Second)
+	b.mu.Unlock()
+	if _, err := b.FetchPlaylist(context.Background(), "cctv1", "localhost"); err != nil {
+		t.Fatal("backend failed to recover", err)
 	}
 }

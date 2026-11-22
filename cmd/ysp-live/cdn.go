@@ -67,6 +67,9 @@ func (m *channelManager) acceptBKSource(ch *channel, result playlistResult) erro
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	now := time.Now()
+	if ch.bkPlaylist != "" && playlistMovedBackwards(ch.bkPlaylist, result.playlist) {
+		return errors.New("BK playlist moved backwards")
+	}
 	media := playlistMediaKey(result.playlist)
 	state := ch.bkSources[result.url]
 	// Check both this source's history and the last served playlist. A source

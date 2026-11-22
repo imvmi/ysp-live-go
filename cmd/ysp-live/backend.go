@@ -22,13 +22,14 @@ type backendManager struct {
 	port   int
 	dir    string
 
-	startMu sync.Mutex // Startup and watchdog may both call Start.
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	ready   bool
-	logFile *rotatingLog
-	done    chan struct{}
-	stopped bool
+	startMu    sync.Mutex // Startup and watchdog may both call Start.
+	mu         sync.Mutex
+	cmd        *exec.Cmd
+	ready      bool
+	logFile    *rotatingLog
+	done       chan struct{}
+	stopped    bool
+	retryAfter time.Time
 }
 
 func resolveBackendPath(value, executableDir string) (string, error) {
@@ -81,7 +82,25 @@ func (b *backendManager) endpoint(path string) string {
 func (b *backendManager) Ready() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.ready && b.cmd != nil && b.cmd.Process != nil
+	return b.ready && b.cmd != nil && b.cmd.Process != nil && !time.Now().Before(b.retryAfter)
+}
+
+func (b *backendManager) checkHealth(ctx context.Context) error {
+	probe, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probe, http.MethodHead, b.endpoint("/4kfifa.m3u"), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("backend health HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (b *backendManager) Start(ctx context.Context) error {
@@ -116,6 +135,9 @@ func (b *backendManager) Start(ctx context.Context) error {
 		}
 		b.mu.Lock()
 		b.ready = !b.stopped && b.cmd != nil
+		if b.ready {
+			b.retryAfter = time.Time{}
+		}
 		ready := b.ready
 		b.mu.Unlock()
 		if !ready {
@@ -175,6 +197,9 @@ func (b *backendManager) Start(ctx context.Context) error {
 	}
 	b.mu.Lock()
 	b.ready = !b.stopped && b.cmd == cmd
+	if b.ready {
+		b.retryAfter = time.Time{}
+	}
 	ready := b.ready
 	b.mu.Unlock()
 	if !ready {
@@ -223,17 +248,41 @@ func (b *backendManager) Watch(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if b.Ready() {
-				continue
-			}
-			startCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-			err := b.Start(startCtx)
-			cancel()
+			err := b.maintain(ctx)
 			if err != nil && ctx.Err() == nil {
 				log.Printf("4K backend restart failed: %v", err)
 			}
 		}
 	}
+}
+
+func (b *backendManager) maintain(ctx context.Context) error {
+	b.mu.Lock()
+	cmd, done, ready := b.cmd, b.done, b.ready
+	b.mu.Unlock()
+	if ready {
+		if b.checkHealth(ctx) == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		b.mu.Lock()
+		b.ready = false
+		b.mu.Unlock()
+		// Only terminate the child owned by this manager.
+		if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	startCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	return b.Start(startCtx)
 }
 
 func (b *backendManager) Stop() {
@@ -283,7 +332,20 @@ func advertisedHost(hostHeader string) string {
 	return host
 }
 
-func (b *backendManager) FetchPlaylist(ctx context.Context, slug, hostHeader string) (string, error) {
+func (b *backendManager) FetchPlaylist(ctx context.Context, slug, hostHeader string) (result string, resultErr error) {
+	b.mu.Lock()
+	cooling := time.Now().Before(b.retryAfter)
+	b.mu.Unlock()
+	if cooling {
+		return "", errors.New("4K backend is cooling down")
+	}
+	defer func() {
+		if resultErr != nil && !errors.Is(resultErr, context.Canceled) {
+			b.mu.Lock()
+			b.retryAfter = time.Now().Add(30 * time.Second)
+			b.mu.Unlock()
+		}
+	}()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.endpoint("/"+slug+".m3u8"), nil)
 	if err != nil {
 		return "", err
@@ -304,6 +366,9 @@ func (b *backendManager) FetchPlaylist(ctx context.Context, slug, hostHeader str
 	playlist := string(body)
 	if !strings.Contains(playlist, "#EXTM3U") {
 		return "", errors.New("4K backend returned a non-M3U8 response")
+	}
+	if err := validateMediaPlaylist(playlist); err != nil {
+		return "", err
 	}
 	host := advertisedHost(hostHeader)
 	if host != "" && host != "127.0.0.1" && host != "localhost" {

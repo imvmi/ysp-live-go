@@ -146,6 +146,7 @@ type channel struct {
 	bkSources     map[string]sourceState
 	bkPreferred   string
 	bkPlaylist    string
+	output        playlistTimeline
 }
 
 type channelManager struct {
@@ -356,6 +357,12 @@ func (m *channelManager) jceRefresh(ctx context.Context, ch *channel) error {
 	if err != nil {
 		return err
 	}
+	ch.mu.Lock()
+	frozen := ch.mode == "jce" && len(segments) > 0 && segmentKey(segments[len(segments)-1].URL, segments[len(segments)-1].PDT) == ch.lastMedia && !ch.lastProgress.IsZero() && time.Since(ch.lastProgress) >= m.maxPlaylistAge
+	ch.mu.Unlock()
+	if frozen {
+		return errors.New("upstream playlist stopped advancing")
+	}
 	return m.mergeSegments(ch, segments)
 }
 
@@ -461,11 +468,31 @@ func (m *channelManager) refreshOnce(ctx context.Context, ch *channel) bool {
 	nextBKProbe := ch.nextBKProbe
 	ch.mu.Unlock()
 	var err error
+	tryBK := func(probe bool) error {
+		budget := 8 * time.Second
+		ch.mu.Lock()
+		cold := ch.lastOK.IsZero()
+		ch.mu.Unlock()
+		if cold {
+			budget = 60 * time.Second
+		}
+		if probe {
+			budget = 2 * time.Second
+		}
+		attempt, cancel := context.WithTimeout(ctx, budget)
+		defer cancel()
+		return m.bkRefresh(attempt, ch)
+	}
+	tryJCE := func() error {
+		attempt, cancel := context.WithTimeout(ctx, 12*time.Second)
+		defer cancel()
+		return m.jceRefresh(attempt, ch)
+	}
 	if mode == "bk" {
-		err = m.bkRefresh(ctx, ch)
+		err = tryBK(false)
 		if err != nil && !forceBK[ch.spec.Slug] && ctx.Err() == nil {
 			bkErr := err
-			err = m.jceRefresh(ctx, ch)
+			err = tryJCE()
 			if err == nil {
 				ch.mu.Lock()
 				ch.mode = "jce"
@@ -476,27 +503,21 @@ func (m *channelManager) refreshOnce(ctx context.Context, ch *channel) bool {
 			}
 		}
 	} else {
-		bkTried := false
-		if !nextBKProbe.IsZero() && !time.Now().Before(nextBKProbe) {
-			bkTried = true
-			err = m.bkRefresh(ctx, ch)
+		// Refresh the working fallback before spending time on an optional probe.
+		err = tryJCE()
+		if err == nil && !nextBKProbe.IsZero() && !time.Now().Before(nextBKProbe) {
+			probeErr := tryBK(true)
 			ch.mu.Lock()
 			ch.nextBKProbe = time.Now().Add(m.bkRetryInterval)
-			if err == nil {
+			if probeErr == nil {
 				ch.mode = "bk"
 				ch.nextBKProbe = time.Time{}
 			}
 			ch.mu.Unlock()
 		}
-		if err != nil || nextBKProbe.IsZero() || time.Now().Before(nextBKProbe) {
-			err = m.jceRefresh(ctx, ch)
-		}
 		if err != nil && ctx.Err() == nil {
 			jceErr := err
-			if bkTried {
-				return m.finishRefresh(ch, started, fmt.Errorf("JCE: %w", jceErr))
-			}
-			if bkErr := m.bkRefresh(ctx, ch); bkErr == nil {
+			if bkErr := tryBK(false); bkErr == nil {
 				ch.mu.Lock()
 				ch.mode = "bk"
 				ch.nextBKProbe = time.Time{}
@@ -592,7 +613,7 @@ func (m *channelManager) refreshLoop(ch *channel) {
 		default:
 		}
 		ch.mu.Unlock()
-		ctx, cancel := context.WithTimeout(m.ctx, 35*time.Second)
+		ctx, cancel := context.WithTimeout(m.ctx, 75*time.Second)
 		ok := m.refreshOnce(ctx, ch)
 		cancel()
 		if ok {
@@ -714,7 +735,7 @@ func (m *channelManager) buildPlaylist(ch *channel) string {
 		return ""
 	}
 	if ch.mode == "bk" {
-		return ch.bkPlaylist
+		return ch.output.normalize(ch.bkPlaylist, "bk")
 	}
 	start := 0
 	if len(ch.order) > 15 {
@@ -752,7 +773,7 @@ func (m *channelManager) buildPlaylist(ch *channel) string {
 		}
 		fmt.Fprintf(&b, "#EXTINF:%.3f,\n%s\n", item.Duration, item.URL)
 	}
-	return b.String()
+	return ch.output.normalize(b.String(), "jce")
 }
 
 type channelDiagnostic struct {

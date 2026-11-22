@@ -167,12 +167,15 @@ func (s *appServer) serveChannel(w http.ResponseWriter, r *http.Request, slug st
 		playlist, err := s.backend.FetchPlaylist(ctx, slug, r.Host)
 		cancel()
 		if err == nil {
+			ch.mu.Lock()
+			playlist = ch.output.normalize(playlist, "backend")
+			ch.mu.Unlock()
 			s.write(w, http.StatusOK, "application/vnd.apple.mpegurl", []byte(playlist))
 			return
 		}
 		log.Printf("4K %s fetch failed, falling back: %v", slug, err)
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 75*time.Second)
 	err := s.channels.ensure(ctx, ch)
 	cancel()
 	playlist := s.channels.buildPlaylist(ch)
