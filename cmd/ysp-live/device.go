@@ -675,7 +675,12 @@ func (m *deviceManager) cloudRegistration(ctx context.Context, identity deviceId
 		return "", err
 	}
 	if code := resultCode(value); code == 0 {
-		return extractDeviceGUID(value), nil
+		if guid := extractDeviceGUID(value); guid != "" {
+			return guid, nil
+		}
+		// Some cloud responses report success for a known-but-unregistered
+		// identity without returning a guid. Continue through registration
+		// instead of treating the empty value as a usable session.
 	} else if code != 601 && code != 2 {
 		return "", fmt.Errorf("cloud device get returned result %d", code)
 	}
@@ -1248,7 +1253,24 @@ func resultCode(value any) int {
 }
 
 func extractDeviceGUID(value any) string {
-	mapping, _ := value.(map[string]any)
-	data, _ := mapping["data"].(map[string]any)
-	return stringValue(data["guid"])
+	switch typed := value.(type) {
+	case map[string]any:
+		for _, key := range []string{"guid", "deviceGuid", "device_guid"} {
+			if guid := stringValue(typed[key]); guid != "" {
+				return guid
+			}
+		}
+		for _, key := range []string{"data", "response", "device"} {
+			if guid := extractDeviceGUID(typed[key]); guid != "" {
+				return guid
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if guid := extractDeviceGUID(item); guid != "" {
+				return guid
+			}
+		}
+	}
+	return ""
 }

@@ -18,6 +18,20 @@ import (
 	"time"
 )
 
+type stubDeviceSource struct {
+	ready atomic.Bool
+	fetch func(context.Context, string, string) (string, error)
+}
+
+func (s *stubDeviceSource) Start(context.Context)                         {}
+func (s *stubDeviceSource) Close()                                        {}
+func (s *stubDeviceSource) Ready() bool                                   { return s.ready.Load() }
+func (s *stubDeviceSource) LastError() string                             { return "" }
+func (s *stubDeviceSource) ServeMedia(http.ResponseWriter, *http.Request) {}
+func (s *stubDeviceSource) FetchPlaylist(ctx context.Context, slug, host string) (string, error) {
+	return s.fetch(ctx, slug, host)
+}
+
 func testDeviceProfile() deviceProfile {
 	return deviceProfile{
 		AndroidID: "0123456789abcdef", MAC: "02:11:22:33:44:55", Hardware: "mt5895", Board: "mt5895",
@@ -248,6 +262,118 @@ func TestDeviceLinkQuotaFallsBackWithoutServiceFailure(t *testing.T) {
 	}
 }
 
+func TestBKSuccessDoesNotWaitForDeviceWarmup(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Upstream-Host") == "bkliveinfo.ysp.cctv.cn" {
+			_, _ = io.WriteString(w, `{"iretcode":0,"playurl":"https://cdn.cctv.cn/live.m3u8"}`)
+			return
+		}
+		_, _ = io.WriteString(w, testPlaylist)
+	}))
+	defer upstream.Close()
+	channels, _ := testManager(t, upstream.URL)
+	ch := channels.channels["cctv1"]
+	ch.bkURLs = []string{"https://cdn.cctv.cn/live.m3u8"}
+	ch.bkPlaylist = "#EXTM3U\n#EXTINF:6,\nhttps://old.invalid/expired.ts\n"
+	ch.lastOK = time.Now().Add(-time.Hour)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var announced atomic.Bool
+	device := &stubDeviceSource{fetch: func(ctx context.Context, _, _ string) (string, error) {
+		if announced.CompareAndSwap(false, true) {
+			close(started)
+		}
+		select {
+		case <-release:
+			return "", errors.New("warm-up stopped")
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}}
+	app := newAppServer(channels, "127.0.0.1", 8767)
+	app.device = device
+
+	response := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		app.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/cctv1.m3u8", nil))
+		response <- recorder
+	}()
+	select {
+	case recorder := <-response:
+		if recorder.Code != http.StatusOK || recorder.Header().Get("X-YSP-Source") != "" || !strings.Contains(recorder.Body.String(), "fresh.ts") {
+			t.Fatalf("BK response status=%d source=%q body=%s", recorder.Code, recorder.Header().Get("X-YSP-Source"), recorder.Body.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("BK response waited for device warm-up")
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("device warm-up did not start in the background")
+	}
+	close(release)
+}
+
+func TestBKFailureFallsBackToDevice(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+	channels, _ := testManager(t, upstream.URL)
+	ch := channels.channels["cctv4k"]
+	ch.bkURLs = []string{"https://cdn.cctv.cn/live.m3u8"}
+	device := &stubDeviceSource{fetch: func(context.Context, string, string) (string, error) {
+		return "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:4,\ndevice.ts\n", nil
+	}}
+	app := newAppServer(channels, "127.0.0.1", 8767)
+	app.device = device
+	recorder := httptest.NewRecorder()
+	app.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/cctv4k.m3u8", nil))
+	if recorder.Code != http.StatusOK || recorder.Header().Get("X-YSP-Source") != "device-go" || !strings.Contains(recorder.Body.String(), "device.ts") {
+		t.Fatalf("device fallback status=%d source=%q body=%s", recorder.Code, recorder.Header().Get("X-YSP-Source"), recorder.Body.String())
+	}
+}
+
+func TestJCEFallbackStillPrefersDeviceSource(t *testing.T) {
+	channels := newChannelManager(http.DefaultClient)
+	defer channels.Close()
+	ch := channels.channels["cctv1"]
+	ch.mode = "jce"
+	ch.segments = map[string]*segment{"jce": {Sequence: 42, Duration: 6, URL: "https://cdn.example/jce.ts"}}
+	ch.order = []string{"jce"}
+	ch.lastOK = time.Now()
+	ch.lastProgress = time.Now()
+	device := &stubDeviceSource{fetch: func(context.Context, string, string) (string, error) {
+		return "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:4,\ndevice.ts\n", nil
+	}}
+	app := newAppServer(channels, "127.0.0.1", 8767)
+	app.device = device
+	recorder := httptest.NewRecorder()
+	app.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/cctv1.m3u8", nil))
+	if recorder.Code != http.StatusOK || recorder.Header().Get("X-YSP-Source") != "device-go" || !strings.Contains(recorder.Body.String(), "device.ts") {
+		t.Fatalf("device preference status=%d source=%q body=%s", recorder.Code, recorder.Header().Get("X-YSP-Source"), recorder.Body.String())
+	}
+}
+
+func TestDeviceBootstrapUsesProcessWideCooldown(t *testing.T) {
+	device := &stubDeviceSource{fetch: func(context.Context, string, string) (string, error) {
+		return "", errors.New("bootstrap failed")
+	}}
+	app := &appServer{device: device}
+	app.recordDeviceAttempt(errors.New("bootstrap failed"))
+	if app.deviceAttemptAllowed() {
+		t.Fatal("device bootstrap retry was not cooled down")
+	}
+	app.deviceMu.Lock()
+	delay := time.Until(app.deviceRetryAt)
+	app.deviceMu.Unlock()
+	if delay < 14*time.Second || delay > 16*time.Second {
+		t.Fatalf("first device cooldown=%s, want about 15s", delay)
+	}
+}
+
 func TestDeviceBusinessErrorDoesNotDestroySession(t *testing.T) {
 	for _, tc := range []struct {
 		status      int
@@ -306,6 +432,35 @@ func TestCloudRegistrationUsesBusinessCodeFromHTTP400(t *testing.T) {
 	profile := testDeviceProfile()
 	guid, err := manager.cloudRegistration(context.Background(), buildDeviceIdentity(profile, time.Now()))
 	if err != nil || guid != "registered-guid" {
+		t.Fatalf("guid=%q err=%v", guid, err)
+	}
+	if gets.Load() != 1 || registers.Load() != 1 {
+		t.Fatalf("cloud calls get=%d register=%d", gets.Load(), registers.Load())
+	}
+}
+
+func TestCloudRegistrationRepairsSuccessfulLookupWithoutGUID(t *testing.T) {
+	var gets, registers atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/get":
+			gets.Add(1)
+			writeTestJSON(w, map[string]any{"result": 0, "data": map[string]any{}})
+		case "/register":
+			registers.Add(1)
+			writeTestJSON(w, map[string]any{"result": 0, "response": map[string]any{"device": map[string]any{"deviceGuid": "repaired-guid"}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	manager := newDeviceManager(upstream.Client(), filepath.Join(t.TempDir(), "device.json"))
+	manager.controlInterval = 0
+	manager.endpoints.CloudGet = upstream.URL + "/get"
+	manager.endpoints.CloudRegister = upstream.URL + "/register"
+	profile := testDeviceProfile()
+	guid, err := manager.cloudRegistration(context.Background(), buildDeviceIdentity(profile, time.Now()))
+	if err != nil || guid != "repaired-guid" {
 		t.Fatalf("guid=%q err=%v", guid, err)
 	}
 	if gets.Load() != 1 || registers.Load() != 1 {
