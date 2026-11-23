@@ -22,8 +22,8 @@ var version = "0.1.0"
 func main() {
 	bind := flag.String("bind", "127.0.0.1", "监听地址；局域网共享可设为 0.0.0.0")
 	port := flag.Int("port", 8767, "HTTP 服务端口")
-	backendFlag := flag.String("backend", "", "4K 后端路径；使用 auto 自动寻找；留空则禁用")
-	backendPort := flag.Int("backend-port", 8766, "4K 后端端口")
+	deviceEnabled := flag.Bool("device", true, "启用内置设备协议，为 CCTV10 等频道提供高码率源")
+	dataDirFlag := flag.String("data-dir", "", "内置设备身份状态目录；默认为本程序所在目录下的 data 目录")
 	maxBandwidth := flag.Int64("max-bandwidth", defaultMaxBandwidth, "多码率直播选择上限（bit/s）；0 选择最高码率")
 	showVersion := flag.Bool("version", false, "显示版本")
 	flag.Parse()
@@ -38,7 +38,7 @@ func main() {
 		}
 		*port = legacyPort
 	}
-	if *port < 1 || *port > 65535 || *backendPort < 1 || *backendPort > 65535 {
+	if *port < 1 || *port > 65535 {
 		log.Fatal("port must be between 1 and 65535")
 	}
 	if *maxBandwidth < 0 {
@@ -53,11 +53,13 @@ func main() {
 		log.Fatal(err)
 	}
 	executableDir := filepath.Dir(executable)
-	backendPath, err := resolveBackendPath(*backendFlag, executableDir)
-	if err != nil {
-		log.Fatal(err)
+	dataDir := filepath.Join(executableDir, "data")
+	if *dataDirFlag != "" {
+		dataDir, err = filepath.Abs(*dataDirFlag)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
-
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 20
@@ -68,23 +70,15 @@ func main() {
 	channels := newChannelManager(client)
 	channels.maxBandwidth = *maxBandwidth
 	defer channels.Close()
-	backend := newBackendManager(client, backendPath, *backendPort, executableDir)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if backendPath != "" {
-		go func() {
-			startCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-			err := backend.Start(startCtx)
-			cancel()
-			if err != nil && ctx.Err() == nil {
-				log.Printf("4K backend unavailable; continuing with fallback streams: %v", err)
-			}
-		}()
-		go backend.Watch(ctx)
+	var device deviceSource
+	if *deviceEnabled {
+		device = newDeviceManager(client, filepath.Join(dataDir, "device-state-go.json"))
+		device.Start(ctx)
 	}
-
-	app := newAppServer(channels, backend, *bind, *port)
+	app := newAppServer(channels, *bind, *port)
+	app.device = device
 	httpServer := &http.Server{
 		Addr:              net.JoinHostPort(*bind, strconv.Itoa(*port)),
 		Handler:           app,
@@ -103,7 +97,9 @@ func main() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
-		backend.Stop()
+		if device != nil {
+			device.Close()
+		}
 	}()
 
 	log.Printf("ysp-live-go %s: %d channels, listening on http://%s/", version, len(channelSpecs), httpServer.Addr)

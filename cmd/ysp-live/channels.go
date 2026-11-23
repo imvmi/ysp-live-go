@@ -96,8 +96,8 @@ var channelSpecs = []channelSpec{
 }
 
 var (
-	forceBK         = stringSet("cctv11", "cctv12", "cctv14", "cctv15", "cctv16", "cctv164k", "cctv17", "cctv4k", "cctvfyjc", "cctvdyjc", "cctvhjjc")
-	backendChannels = stringSet(
+	forceBK        = stringSet("cctv11", "cctv12", "cctv14", "cctv15", "cctv16", "cctv164k", "cctv17", "cctv4k", "cctvfyjc", "cctvdyjc", "cctvhjjc")
+	deviceChannels = stringSet(
 		"cctv1", "cctv2", "cctv3", "cctv4", "cctv5", "cctv5p",
 		"cctv7", "cctv8", "cctv9", "cctv10", "cctv11", "cctv12", "cctv13", "cctv14", "cctv15", "cctv16", "cctv17",
 		"cctv4k", "cctv8k", "cctv164k", "cgtn", "cgtnfr", "cgtnru", "cgtnar", "cgtnes", "cgtndoc",

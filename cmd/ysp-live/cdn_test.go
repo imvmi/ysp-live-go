@@ -52,7 +52,7 @@ func TestColdLoadAndChannelSwitchAvoidSlowCDN(t *testing.T) {
 	urls := []string{"https://bklive-test.ysp.cctv.cn/slow.m3u8", "https://bklive-test.ysp.cctv.cn/fast.m3u8"}
 	m.setBKURLs(ch, urls)
 	m.setBKURLs(m.channels["cctv12"], urls)
-	app := httptest.NewServer(newAppServer(m, nil, "127.0.0.1", 8767))
+	app := httptest.NewServer(newAppServer(m, "127.0.0.1", 8767))
 	defer app.Close()
 	get := func(slug string) time.Duration {
 		t.Helper()

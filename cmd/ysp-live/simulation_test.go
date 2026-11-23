@@ -30,7 +30,7 @@ func TestPostmanLatencyAndSourceSelection(t *testing.T) {
 			m.client.Timeout = 35 * time.Second
 			// Include discovery in the first-load timing.
 			m.setBKURLs(ch, nil)
-			app := httptest.NewServer(newAppServer(m, nil, "127.0.0.1", 8767))
+			app := httptest.NewServer(newAppServer(m, "127.0.0.1", 8767))
 			defer app.Close()
 			get := func() (string, time.Duration) {
 				t.Helper()

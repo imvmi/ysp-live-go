@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -14,7 +15,7 @@ import (
 
 type appServer struct {
 	channels *channelManager
-	backend  *backendManager
+	device   deviceSource
 	gala     *galaResolver
 	port     int
 	bind     string
@@ -45,17 +46,16 @@ const indexTemplate = `<!DOCTYPE html>
 <title>央视频全频道直播</title>
 <style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:760px;margin:0 auto;padding:20px}li{margin:6px 0}.tag{color:#b00020;font-weight:600}.path{color:#777;font-size:12px;margin-left:8px}</style>
 </head><body>
-<h2>央视频全频道直播（{{.Count}} 路{{if .BackendReady}}，含真 4K{{end}}）</h2>
+<h2>央视频全频道直播（{{.Count}} 路{{if .BackendReady}}，含设备协议源{{end}}）</h2>
 <p>将链接粘贴到播放器即可观看。普通频道的分片由播放器直连央视 CDN；设备协议频道可能经本地后端中继。</p>
 <p>聚合订阅：<a href="/all.m3u">/all.m3u</a></p>
 <h3>历届春晚点播</h3><ul>{{range .VODs}}<li><a href="{{.Path}}">{{.Name}}</a></li>{{end}}</ul>
 <ul>{{range .Channels}}<li><a href="/{{.Slug}}.m3u8">{{.Name}}</a>{{if .Tag}} <span class="tag">[{{.Tag}}]</span>{{end}} <span class="path">/{{.Slug}}.m3u8</span></li>{{end}}</ul>
 </body></html>`
 
-func newAppServer(channels *channelManager, backend *backendManager, bind string, port int) *appServer {
+func newAppServer(channels *channelManager, bind string, port int) *appServer {
 	return &appServer{
 		channels: channels,
-		backend:  backend,
 		bind:     bind,
 		port:     port,
 		index:    template.Must(template.New("index").Parse(indexTemplate)),
@@ -83,8 +83,30 @@ func (s *appServer) publicHost(r *http.Request) string {
 	return net.JoinHostPort(host, strconv.Itoa(s.port))
 }
 
+func advertisedHost(hostHeader string) string {
+	host := hostHeader
+	if h, _, err := net.SplitHostPort(hostHeader); err == nil {
+		host = h
+	} else if strings.Count(hostHeader, ":") == 1 {
+		host = strings.SplitN(hostHeader, ":", 2)[0]
+	}
+	host = strings.Trim(host, "[] ")
+	if host == "" {
+		return ""
+	}
+	if net.ParseIP(host) != nil {
+		return host
+	}
+	for _, r := range host {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '.' && r != '-' {
+			return ""
+		}
+	}
+	return host
+}
+
 func (s *appServer) serveIndex(w http.ResponseWriter) {
-	ready := s.backend != nil && s.backend.Ready()
+	ready := s.device != nil
 	data := indexData{Count: len(channelSpecs), BackendReady: ready}
 	for _, source := range galaSources {
 		data.VODs = append(data.VODs, indexVOD{Name: source.Name, Path: "/vod/spring-gala/" + source.Slug + ".mp4"})
@@ -93,7 +115,7 @@ func (s *appServer) serveIndex(w http.ResponseWriter) {
 		tag := ""
 		if ready && true4KChannels[spec.Slug] {
 			tag = "真 4K"
-		} else if ready && backendChannels[spec.Slug] {
+		} else if ready && deviceChannels[spec.Slug] {
 			tag = "高码率"
 		}
 		data.Channels = append(data.Channels, indexChannel{Slug: spec.Slug, Name: spec.Name, Tag: tag})
@@ -134,10 +156,16 @@ func channelGroup(spec channelSpec) string {
 
 func (s *appServer) serveDiagnostics(w http.ResponseWriter) {
 	var body strings.Builder
-	if s.backend != nil && s.backend.Ready() {
-		body.WriteString("4K后端: 就绪\n")
+	if s.device == nil {
+		body.WriteString("内置设备协议: 已禁用\n")
+	} else if s.device.Ready() {
+		body.WriteString("内置设备协议: 会话就绪\n")
 	} else {
-		body.WriteString("4K后端: 未启用或未就绪（普通清晰度回落）\n")
+		body.WriteString("内置设备协议: 等待首次使用")
+		if lastError := s.device.LastError(); lastError != "" {
+			fmt.Fprintf(&body, "（%s）", lastError)
+		}
+		body.WriteByte('\n')
 	}
 	now := time.Now()
 	for _, item := range s.channels.diagnostics() {
@@ -162,18 +190,21 @@ func (s *appServer) serveChannel(w http.ResponseWriter, r *http.Request, slug st
 		s.write(w, http.StatusNotFound, "text/plain; charset=utf-8", []byte("未知频道\n"))
 		return
 	}
-	if s.backend != nil && backendChannels[slug] && s.backend.Ready() {
-		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
-		playlist, err := s.backend.FetchPlaylist(ctx, slug, r.Host)
+	if s.device != nil && deviceChannels[slug] {
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		playlist, err := s.device.FetchPlaylist(ctx, slug, s.publicHost(r))
 		cancel()
 		if err == nil {
 			ch.mu.Lock()
-			playlist = ch.output.normalize(playlist, "backend")
+			playlist = ch.output.normalize(playlist, "device-go")
 			ch.mu.Unlock()
+			w.Header().Set("X-YSP-Source", "device-go")
 			s.write(w, http.StatusOK, "application/vnd.apple.mpegurl", []byte(playlist))
 			return
 		}
-		log.Printf("4K %s fetch failed, falling back: %v", slug, err)
+		if !errors.Is(err, errDeviceLinkQuota) && !errors.Is(err, errDeviceCoolingDown) {
+			log.Printf("built-in device %s fetch failed, falling back: %v", slug, err)
+		}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 75*time.Second)
 	err := s.channels.ensure(ctx, ch)
@@ -226,6 +257,14 @@ func (s *appServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.write(w, http.StatusNotFound, "text/plain; charset=utf-8", []byte("not found\n"))
 		}
 	default:
+		if strings.HasPrefix(path, "/_device/media/") {
+			if s.device == nil {
+				s.write(w, http.StatusNotFound, "text/plain; charset=utf-8", []byte("not found\n"))
+				return
+			}
+			s.device.ServeMedia(w, r)
+			return
+		}
 		if strings.HasPrefix(path, "/vod/spring-gala/") && strings.HasSuffix(path, ".mp4") {
 			slug := strings.TrimSuffix(strings.TrimPrefix(path, "/vod/spring-gala/"), ".mp4")
 			if source, ok := galaSourceBySlug(slug); ok {

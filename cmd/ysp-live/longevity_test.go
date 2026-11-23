@@ -3,11 +3,8 @@ package main
 import (
 	"context"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -54,44 +51,6 @@ func TestResetConfirmationSurvivesSignatureRenewal(t *testing.T) {
 	m.setBKURLs(ch, []string{second})
 	if err := m.acceptBKSource(ch, playlistResult{url: second, playlist: liveWindow(2, "new")}); err != nil {
 		t.Fatal("signature renewal erased restart confirmation:", err)
-	}
-}
-
-func TestBackendStartupTimeoutReapsUnreadyChild(t *testing.T) {
-	t.Setenv("YSP_TEST_BACKEND_PROCESS", "1")
-	t.Setenv("YSP_TEST_BACKEND_UNREADY", "1")
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, portText, _ := net.SplitHostPort(listener.Addr().String())
-	listener.Close()
-	port, _ := strconv.Atoi(portText)
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	b := newBackendManager(&http.Client{Timeout: time.Second}, exe, port, t.TempDir())
-	defer b.Stop()
-	for attempt := 0; attempt < 5; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-		err = b.Start(ctx)
-		cancel()
-		if err == nil {
-			t.Fatal("unready child unexpectedly started")
-		}
-		b.mu.Lock()
-		leftover := b.cmd != nil || b.logFile != nil || b.ready
-		b.mu.Unlock()
-		if leftover {
-			t.Fatal("timed-out startup retained child or log handle")
-		}
-	}
-	t.Setenv("YSP_TEST_BACKEND_UNREADY", "0")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := b.Start(ctx); err != nil || !b.Ready() {
-		t.Fatal("could not start a replacement child", err)
 	}
 }
 

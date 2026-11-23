@@ -174,7 +174,7 @@ func TestAllChannelsColdStartWithProductionRateLimit(t *testing.T) {
 	defer upstream.Close()
 	m, _ := testManager(t, upstream.URL)
 	m.bkInterval = 700 * time.Millisecond
-	app := httptest.NewServer(newAppServer(m, nil, "127.0.0.1", 8767))
+	app := httptest.NewServer(newAppServer(m, "127.0.0.1", 8767))
 	defer app.Close()
 	var wg sync.WaitGroup
 	for _, spec := range channelSpecs {

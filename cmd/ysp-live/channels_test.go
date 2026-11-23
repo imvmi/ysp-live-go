@@ -91,7 +91,7 @@ func TestIdleReopenSharesRefresh(t *testing.T) {
 	defer upstream.Close()
 	defer once.Do(func() { close(release) })
 	m, ch := testManager(t, upstream.URL)
-	app := newAppServer(m, nil, "127.0.0.1", 8767)
+	app := newAppServer(m, "127.0.0.1", 8767)
 	results := make(chan *httptest.ResponseRecorder, 24)
 	for i := 0; i < cap(results); i++ {
 		go func() {
@@ -175,7 +175,7 @@ func TestStaleFailureBackoffAndRecovery(t *testing.T) {
 	}))
 	defer upstream.Close()
 	m, ch := testManager(t, upstream.URL)
-	app := newAppServer(m, nil, "127.0.0.1", 8767)
+	app := newAppServer(m, "127.0.0.1", 8767)
 	w := httptest.NewRecorder()
 	app.ServeHTTP(w, httptest.NewRequest("GET", "/cctv11.m3u8", nil))
 	if w.Code != 503 || w.Header().Get("Retry-After") == "" {
@@ -512,7 +512,7 @@ func TestPostmanSimulation(t *testing.T) {
 		t.Skip("set HLS_SIMULATION_URL to run the Postman HTTP simulation")
 	}
 	m, ch := testManager(t, base)
-	app := httptest.NewServer(newAppServer(m, nil, "127.0.0.1", 8767))
+	app := httptest.NewServer(newAppServer(m, "127.0.0.1", 8767))
 	defer app.Close()
 	control := func(mode string) {
 		resp, err := http.Post(strings.TrimRight(base, "/")+"/control?mode="+mode, "text/plain", nil)
