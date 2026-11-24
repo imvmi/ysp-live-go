@@ -299,8 +299,9 @@ func (s *appServer) serveChannelWithBudget(w http.ResponseWriter, r *http.Reques
 		if deviceErr == nil {
 			ch.mu.Lock()
 			devicePlaylist = ch.output.normalizeWithIdentity(devicePlaylist, "device-go", s.device.MediaIdentity)
+			servedSource := ch.output.source
 			ch.mu.Unlock()
-			w.Header().Set("X-YSP-Source", "device-go")
+			w.Header().Set("X-YSP-Source", servedSource)
 			s.write(w, http.StatusOK, "application/vnd.apple.mpegurl", []byte(devicePlaylist))
 			return
 		}

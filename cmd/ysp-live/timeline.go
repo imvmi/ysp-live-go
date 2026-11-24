@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +22,10 @@ type playlistTimeline struct {
 	lastInputEpoch        uint64
 	identities            map[uint64]string
 	switched              bool
+	retained              []timelineMedia
+	trimOrigin, trimFloor uint64
+	lastOutputStart       uint64
+	lastPlaylist          string
 }
 
 type playlistPosition struct {
@@ -68,32 +74,113 @@ func (t *playlistTimeline) normalize(text, source string) string {
 	return t.normalizeWithIdentity(text, source, func(uri string) string { return segmentKey(uri, "") })
 }
 
+// BK serves the same TS file through multiple CDNs and signed path prefixes.
+// Only use the provider's stable identity when all identifying metadata is
+// present; a basename alone cannot distinguish unrelated streams or restarts.
+func bkMediaIdentity(rawURL, sid, pdt, duration string) (string, bool) {
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || !strings.HasSuffix(strings.ToLower(u.Hostname()), ".ysp.cctv.cn") {
+		return "", false
+	}
+	name := path.Base(u.Path)
+	stream, fileSID, ok := strings.Cut(strings.TrimSuffix(name, ".ts"), "-")
+	if !ok || !strings.HasSuffix(name, ".ts") || fileSID != sid {
+		return "", false
+	}
+	if _, err := strconv.ParseUint(stream, 10, 64); err != nil {
+		return "", false
+	}
+	if _, err := strconv.ParseUint(sid, 10, 64); err != nil {
+		return "", false
+	}
+	stamp, err := time.Parse(time.RFC3339Nano, pdt)
+	if err != nil {
+		return "", false
+	}
+	length, err := time.ParseDuration(duration + "s")
+	if err != nil || length <= 0 {
+		return "", false
+	}
+	return "bk:" + name + "|" + stamp.UTC().Format(time.RFC3339Nano) + "|" + length.String(), true
+}
+
 func (t *playlistTimeline) normalizeWithIdentity(text, source string, mediaIdentity func(string) string) string {
 	p := mediaPosition(text)
 	if p.count == 0 {
 		return ""
 	}
+	if source == t.source && p.sequence >= t.trimOrigin && p.sequence < t.trimFloor && t.trimFloor-p.sequence < p.count && len(overlapMedia(text, mediaIdentity)) > 0 {
+		text = trimTimelinePrefix(text, int(t.trimFloor-p.sequence))
+		p = mediaPosition(text)
+	}
+	var anchor timelineMedia
+	aligned := false
+	origin := p.sequence
+	if t.source != "" && source != t.source {
+		items := overlapMedia(text, mediaIdentity)
+		if skip, match, ok := matchingOverlap(t.retained, items, t.lastOutputStart); ok {
+			if skip == len(items) {
+				// Every incoming segment is already behind the published
+				// window. Do not move MEDIA-SEQUENCE backwards or replay it.
+				return t.lastPlaylist
+			}
+			trimmed := trimTimelinePrefix(text, skip)
+			position := mediaPosition(trimmed)
+			// A leading upstream discontinuity must fit below the retained
+			// segment's epoch; otherwise keep the explicit fallback boundary.
+			if leading := items[skip].epoch - position.epoch; match.epoch >= leading {
+				text, p, anchor, aligned = trimmed, position, match, true
+				anchor.epoch -= leading
+			}
+		}
+	}
 	identities := make(map[uint64]string, p.count)
 	inputIndex := p.sequence
 	byteRange := ""
+	var sid, pdt, duration string
+	// Encrypted media and initialization sections need additional identity
+	// rules. Keep the existing URL-based behavior for these formats.
+	complexMedia := strings.Contains(text, "#EXT-X-KEY:") || strings.Contains(text, "#EXT-X-MAP:")
 	conflict := false
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "#EXT-X-BYTERANGE:") {
+		switch {
+		case strings.HasPrefix(line, "#EXT-X-BYTERANGE:"):
 			byteRange = line
+		case strings.HasPrefix(line, "#EXT-SID:"):
+			sid = strings.TrimPrefix(line, "#EXT-SID:")
+		case strings.HasPrefix(line, "#EXT-X-PROGRAM-DATE-TIME:"):
+			pdt = strings.TrimPrefix(line, "#EXT-X-PROGRAM-DATE-TIME:")
+		case strings.HasPrefix(line, "#EXTINF:"):
+			duration = strings.SplitN(strings.TrimPrefix(line, "#EXTINF:"), ",", 2)[0]
 		}
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		identity := mediaIdentity(line) + "|" + byteRange
+		identity := mediaIdentity(line)
+		if !complexMedia {
+			if sid == "" && (source == "jce" || source == "device-go") {
+				sid = mediaSID(identity)
+			}
+			if stable, ok := bkMediaIdentity(identity, sid, pdt, duration); ok {
+				identity = stable
+			}
+		}
+		identity += "|" + byteRange
 		identities[inputIndex] = identity
 		if old, ok := t.identities[inputIndex]; ok && old != identity {
 			conflict = true
 		}
 		inputIndex++
 		byteRange = ""
+		sid, pdt, duration = "", "", ""
 	}
-	if t.source == "" {
+	if aligned {
+		t.source, t.inputBase, t.outputBase = source, p.sequence, anchor.sequence
+		t.epochIn, t.epochOut = p.epoch, anchor.epoch
+		t.switched = false
+		t.trimOrigin, t.trimFloor = origin, p.sequence
+	} else if t.source == "" {
 		t.source, t.inputBase, t.outputBase = source, p.sequence, p.sequence
 		t.epochIn, t.epochOut = p.epoch, p.epoch
 	} else if t.source != source || p.sequence < t.lastStart || p.epoch < t.lastInputEpoch || conflict ||
@@ -103,6 +190,8 @@ func (t *playlistTimeline) normalizeWithIdentity(text, source string, mediaIdent
 		t.source, t.inputBase, t.outputBase = source, p.sequence, t.last+1
 		t.epochIn, t.epochOut = p.epoch, t.lastEpoch+1
 		t.boundary, t.switched = p.sequence, true
+		t.trimOrigin, t.trimFloor = 0, 0
+		t.retained = nil
 	}
 	seq := t.outputBase + (p.sequence - t.inputBase)
 	epoch := t.epochOut + (p.epoch - t.epochIn)
@@ -146,10 +235,17 @@ func (t *playlistTimeline) normalizeWithIdentity(text, source string, mediaIdent
 			inputSeq++
 		}
 	}
-	t.last = seq + p.count - 1
+	if end := seq + p.count - 1; end > t.last {
+		t.last = end
+	}
 	t.lastStart = p.sequence
 	t.lastInputEpoch = p.epoch
 	t.identities = identities
-	t.lastEpoch = epoch
-	return out.String()
+	if epoch > t.lastEpoch {
+		t.lastEpoch = epoch
+	}
+	result := out.String()
+	t.retained = retainTimelineMedia(t.retained, overlapMedia(result, mediaIdentity))
+	t.lastOutputStart, t.lastPlaylist = seq, result
+	return result
 }
