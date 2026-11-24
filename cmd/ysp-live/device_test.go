@@ -27,6 +27,8 @@ func (s *stubDeviceSource) Start(context.Context)                         {}
 func (s *stubDeviceSource) Close()                                        {}
 func (s *stubDeviceSource) Ready() bool                                   { return s.ready.Load() }
 func (s *stubDeviceSource) LastError() string                             { return "" }
+func (s *stubDeviceSource) Diagnostics() deviceDiagnostics                { return deviceDiagnostics{} }
+func (s *stubDeviceSource) MediaIdentity(raw string) string               { return segmentKey(raw, "") }
 func (s *stubDeviceSource) ServeMedia(http.ResponseWriter, *http.Request) {}
 func (s *stubDeviceSource) FetchPlaylist(ctx context.Context, slug, host string) (string, error) {
 	return s.fetch(ctx, slug, host)
@@ -262,7 +264,7 @@ func TestDeviceLinkQuotaFallsBackWithoutServiceFailure(t *testing.T) {
 	}
 }
 
-func TestBKSuccessDoesNotWaitForDeviceWarmup(t *testing.T) {
+func TestBKSuccessDoesNotStartDeviceWarmup(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Upstream-Host") == "bkliveinfo.ysp.cctv.cn" {
 			_, _ = io.WriteString(w, `{"iretcode":0,"playurl":"https://cdn.cctv.cn/live.m3u8"}`)
@@ -277,19 +279,10 @@ func TestBKSuccessDoesNotWaitForDeviceWarmup(t *testing.T) {
 	ch.bkPlaylist = "#EXTM3U\n#EXTINF:6,\nhttps://old.invalid/expired.ts\n"
 	ch.lastOK = time.Now().Add(-time.Hour)
 
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var announced atomic.Bool
-	device := &stubDeviceSource{fetch: func(ctx context.Context, _, _ string) (string, error) {
-		if announced.CompareAndSwap(false, true) {
-			close(started)
-		}
-		select {
-		case <-release:
-			return "", errors.New("warm-up stopped")
-		case <-ctx.Done():
-			return "", ctx.Err()
-		}
+	called := make(chan struct{}, 1)
+	device := &stubDeviceSource{fetch: func(context.Context, string, string) (string, error) {
+		called <- struct{}{}
+		return "", errors.New("unexpected device warm-up")
 	}}
 	app := newAppServer(channels, "127.0.0.1", 8767)
 	app.device = device
@@ -309,11 +302,11 @@ func TestBKSuccessDoesNotWaitForDeviceWarmup(t *testing.T) {
 		t.Fatal("BK response waited for device warm-up")
 	}
 	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("device warm-up did not start in the background")
+	case <-called:
+		t.Fatal("working BK source triggered device warm-up")
+	case <-time.After(100 * time.Millisecond):
 	}
-	close(release)
+
 }
 
 func TestBKFailureFallsBackToDevice(t *testing.T) {
@@ -336,24 +329,63 @@ func TestBKFailureFallsBackToDevice(t *testing.T) {
 	}
 }
 
-func TestJCEFallbackStillPrefersDeviceSource(t *testing.T) {
-	channels := newChannelManager(http.DefaultClient)
-	defer channels.Close()
-	ch := channels.channels["cctv1"]
-	ch.mode = "jce"
-	ch.segments = map[string]*segment{"jce": {Sequence: 42, Duration: 6, URL: "https://cdn.example/jce.ts"}}
-	ch.order = []string{"jce"}
-	ch.lastOK = time.Now()
-	ch.lastProgress = time.Now()
+func TestJCESuccessDoesNotFetchDeviceSource(t *testing.T) {
+	for _, ready := range []bool{false, true} {
+		t.Run(strconv.FormatBool(ready), func(t *testing.T) {
+			channels := newChannelManager(http.DefaultClient)
+			defer channels.Close()
+			ch := channels.channels["cctv1"]
+			ch.workerRunning = true // Keep this response-selection test offline.
+			ch.mode = "jce"
+			ch.segments = map[string]*segment{"jce": {Sequence: 42, Duration: 6, URL: "https://cdn.example/jce.ts"}}
+			ch.order = []string{"jce"}
+			ch.lastOK, ch.lastProgress = time.Now(), time.Now()
+			var calls atomic.Int32
+			device := &stubDeviceSource{fetch: func(context.Context, string, string) (string, error) {
+				calls.Add(1)
+				return "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:4,\ndevice.ts\n", nil
+			}}
+			device.ready.Store(ready)
+			app := newAppServer(channels, "127.0.0.1", 8767)
+			app.device = device
+			for i := 0; i < 3; i++ {
+				recorder := httptest.NewRecorder()
+				app.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/cctv1.m3u8", nil))
+				if recorder.Code != http.StatusOK || recorder.Header().Get("X-YSP-Source") != "" || !strings.Contains(recorder.Body.String(), "jce.ts") {
+					t.Fatalf("JCE response status=%d source=%q body=%s", recorder.Code, recorder.Header().Get("X-YSP-Source"), recorder.Body.String())
+				}
+			}
+			if calls.Load() != 0 {
+				t.Fatalf("working JCE requested device source %d times", calls.Load())
+			}
+		})
+	}
+}
+
+func TestBKAndJCEFailureStillFetchesDeviceSource(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+	channels, _ := testManager(t, upstream.URL)
+	var calls atomic.Int32
 	device := &stubDeviceSource{fetch: func(context.Context, string, string) (string, error) {
+		calls.Add(1)
 		return "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:4,\ndevice.ts\n", nil
 	}}
 	app := newAppServer(channels, "127.0.0.1", 8767)
 	app.device = device
 	recorder := httptest.NewRecorder()
-	app.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/cctv1.m3u8", nil))
-	if recorder.Code != http.StatusOK || recorder.Header().Get("X-YSP-Source") != "device-go" || !strings.Contains(recorder.Body.String(), "device.ts") {
-		t.Fatalf("device preference status=%d source=%q body=%s", recorder.Code, recorder.Header().Get("X-YSP-Source"), recorder.Body.String())
+	app.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/cctv10.m3u8", nil))
+	if calls.Load() != 1 || recorder.Code != http.StatusOK || recorder.Header().Get("X-YSP-Source") != "device-go" {
+		t.Fatalf("missing device fallback: calls=%d status=%d source=%q", calls.Load(), recorder.Code, recorder.Header().Get("X-YSP-Source"))
+	}
+	ch := channels.channels["cctv10"]
+	ch.mu.Lock()
+	bk, jce := ch.bkStatus, ch.jceStatus
+	ch.mu.Unlock()
+	if !strings.Contains(bk, "503") || !strings.Contains(jce, "503") {
+		t.Fatalf("both primary sources were not tried: bk=%q jce=%q", bk, jce)
 	}
 }
 
@@ -604,4 +636,37 @@ func TestDeviceAllChannelsRotateWithinLinkQuota(t *testing.T) {
 func writeTestJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func TestPrimaryRecoveryDuringDeviceAttemptTakesPrecedence(t *testing.T) {
+	channels := newChannelManager(http.DefaultClient)
+	defer channels.Close()
+	ch := channels.channels["cctv10"]
+	ch.workerRunning = true
+	ch.lastError = "no primary playlist"
+	ch.nextRetry = time.Now().Add(time.Minute)
+	app := newAppServer(channels, "localhost", 8767)
+	var calls atomic.Int32
+	app.device = &stubDeviceSource{fetch: func(context.Context, string, string) (string, error) {
+		calls.Add(1)
+		ch.mu.Lock()
+		ch.bkPlaylist = testPlaylist
+		ch.lastOK, ch.lastProgress = time.Now(), time.Now()
+		ch.lastError = ""
+		ch.mu.Unlock()
+		return "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:4,\ndevice.ts\n", nil
+	}}
+	for i := 0; i < 2; i++ {
+		recorder := httptest.NewRecorder()
+		app.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/cctv10.m3u8", nil))
+		if recorder.Code != http.StatusOK || recorder.Header().Get("X-YSP-Source") != "" || !strings.Contains(recorder.Body.String(), "fresh.ts") {
+			t.Fatalf("recovered BK not selected: status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		if mediaPosition(recorder.Body.String()).sequence != 42 {
+			t.Fatal("unused device response changed the BK timeline")
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("recovered primary kept fetching device source: calls=%d", calls.Load())
+	}
 }

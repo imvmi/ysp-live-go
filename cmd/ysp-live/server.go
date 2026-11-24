@@ -18,13 +18,11 @@ type appServer struct {
 	channels *channelManager
 	device   deviceSource
 	gala     *galaResolver
-	ctx      context.Context
 	port     int
 	bind     string
 	index    *template.Template
 
 	deviceMu       sync.Mutex
-	deviceWarming  bool
 	deviceFailures int
 	deviceRetryAt  time.Time
 }
@@ -63,7 +61,6 @@ const indexTemplate = `<!DOCTYPE html>
 func newAppServer(channels *channelManager, bind string, port int) *appServer {
 	return &appServer{
 		channels: channels,
-		ctx:      context.Background(),
 		bind:     bind,
 		port:     port,
 		index:    template.Must(template.New("index").Parse(indexTemplate)),
@@ -111,39 +108,6 @@ func (s *appServer) recordDeviceAttempt(err error) {
 	}
 	s.deviceFailures++
 	s.deviceRetryAt = time.Now().Add(deviceRetryDelay(s.deviceFailures))
-}
-
-// Warm one device session in the background after BK has already been served.
-// FetchPlaylist also primes the current channel entry, but never delays the
-// response that started the warm-up.
-func (s *appServer) warmDevice(slug, publicHost string) {
-	if s.device == nil || !deviceChannels[slug] || s.device.Ready() {
-		return
-	}
-	s.deviceMu.Lock()
-	if s.deviceWarming || time.Now().Before(s.deviceRetryAt) {
-		s.deviceMu.Unlock()
-		return
-	}
-	s.deviceWarming = true
-	s.deviceMu.Unlock()
-
-	go func() {
-		ctx := s.ctx
-		if ctx == nil {
-			ctx = context.Background()
-		}
-		attempt, cancel := context.WithTimeout(ctx, 20*time.Second)
-		_, err := s.device.FetchPlaylist(attempt, slug, publicHost)
-		cancel()
-		s.recordDeviceAttempt(err)
-		s.deviceMu.Lock()
-		s.deviceWarming = false
-		s.deviceMu.Unlock()
-		if err != nil && !errors.Is(err, errDeviceLinkQuota) && !errors.Is(err, errDeviceCoolingDown) && !errors.Is(err, context.Canceled) {
-			log.Printf("built-in device warm-up failed: %v", err)
-		}
-	}()
 }
 
 func (s *appServer) write(w http.ResponseWriter, status int, contentType string, body []byte) {
@@ -239,16 +203,36 @@ func channelGroup(spec channelSpec) string {
 
 func (s *appServer) serveDiagnostics(w http.ResponseWriter) {
 	var body strings.Builder
+	fmt.Fprintf(&body, "ysp-live-go version=%s\n", version)
+	var deviceState deviceDiagnostics
 	if s.device == nil {
 		body.WriteString("内置设备协议: 已禁用\n")
-	} else if s.device.Ready() {
-		body.WriteString("内置设备协议: 会话就绪\n")
 	} else {
-		body.WriteString("内置设备协议: 等待首次使用")
-		if lastError := s.device.LastError(); lastError != "" {
+		deviceState = s.device.Diagnostics()
+		lastError := s.device.LastError()
+		switch {
+		case s.device.Ready():
+			body.WriteString("内置设备协议: 会话就绪")
+		case lastError != "":
+			body.WriteString("内置设备协议: 会话初始化失败")
+		default:
+			body.WriteString("内置设备协议: 等待首次使用")
+		}
+		if lastError != "" {
 			fmt.Fprintf(&body, "（%s）", lastError)
 		}
 		body.WriteByte('\n')
+		s.deviceMu.Lock()
+		retryAt := s.deviceRetryAt
+		s.deviceMu.Unlock()
+		if time.Now().Before(retryAt) {
+			fmt.Fprintf(&body, "device_bootstrap_retry_at=%s\n", retryAt.UTC().Format(time.RFC3339))
+		}
+		for _, attempt := range deviceState.Cloud {
+			fmt.Fprintf(&body, "device_cloud stage=%s at=%s http=%d result=%d guid=%t shape=%s err=%q\n",
+				attempt.Stage, attempt.At.UTC().Format(time.RFC3339), attempt.HTTP, attempt.Result,
+				attempt.HasGUID, attempt.Shape, attempt.Error)
+		}
 	}
 	now := time.Now()
 	for _, item := range s.channels.diagnostics() {
@@ -263,61 +247,76 @@ func (s *appServer) serveDiagnostics(w http.ResponseWriter) {
 		fmt.Fprintf(&body, "%s mode=%s source=%s 最后成功=%s 分片更新=%s refresh_ms=%d rate_limited=%d worker=%t fresh=%t err=%s\n",
 			item.Slug, item.Mode, item.SourceHost, age, progress, item.LastRefresh.Milliseconds(), item.RateLimited,
 			item.WorkerRunning, item.Fresh, item.LastError)
+		if item.BKStatus != "" || item.JCEStatus != "" || deviceState.Errors[item.Slug] != "" {
+			fmt.Fprintf(&body, "  %s bk=%q jce=%q device_err=%q\n", item.Slug, item.BKStatus, item.JCEStatus, deviceState.Errors[item.Slug])
+		}
 	}
 	s.write(w, http.StatusOK, "text/plain; charset=utf-8", []byte(body.String()))
 }
 
 func (s *appServer) serveChannel(w http.ResponseWriter, r *http.Request, slug string) {
+	s.serveChannelWithBudget(w, r, slug, 75*time.Second, deviceRefreshTimeout)
+}
+
+func (s *appServer) serveChannelWithBudget(w http.ResponseWriter, r *http.Request, slug string, totalBudget, deviceBudget time.Duration) {
 	ch := s.channels.channels[slug]
 	if ch == nil {
 		s.write(w, http.StatusNotFound, "text/plain; charset=utf-8", []byte("未知频道\n"))
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 75*time.Second)
-	err := s.channels.ensure(ctx, ch)
-	cancel()
-	playlist := s.channels.buildPlaylist(ch)
-	ch.mu.Lock()
-	mode := ch.mode
-	ch.mu.Unlock()
+	ctx, cancel := context.WithTimeout(r.Context(), totalBudget)
+	defer cancel()
 	deviceFallback := s.device != nil && deviceChannels[slug]
-	if playlist != "" && (!deviceFallback || mode == "bk") {
-		if deviceFallback {
-			s.warmDevice(slug, s.publicHost(r))
-		}
+	primaryCtx := ctx
+	primaryCancel := func() {}
+	if deviceFallback && s.deviceAttemptAllowed() {
+		// Reserve time for the device fallback within the same request budget.
+		primaryCtx, primaryCancel = context.WithTimeout(ctx, max(0, totalBudget-deviceBudget))
+	}
+	err := s.channels.ensure(primaryCtx, ch)
+	primaryCancel()
+	playlist := s.channels.buildPlaylist(ch)
+	if playlist != "" {
 		s.write(w, http.StatusOK, "application/vnd.apple.mpegurl", []byte(playlist))
 		return
 	}
 
-	// BK is the fast default. Only put the device source on the request path
-	// when BK has no playable playlist, and skip known-broken session bootstrap
-	// during the process-wide cooldown.
+	// Only try the device source when neither BK nor JCE has a fresh playlist.
+	// A working primary source must not trigger device registration or warm-up.
 	if deviceFallback && s.deviceAttemptAllowed() {
-		deviceCtx, deviceCancel := context.WithTimeout(r.Context(), 20*time.Second)
+		deviceCtx, deviceCancel := context.WithTimeout(ctx, deviceBudget)
 		devicePlaylist, deviceErr := s.device.FetchPlaylist(deviceCtx, slug, s.publicHost(r))
+		if deviceCtx.Err() == nil {
+			s.recordDeviceAttempt(deviceErr)
+		}
 		deviceCancel()
-		s.recordDeviceAttempt(deviceErr)
+		// Prefer a primary source that recovered while the device request was
+		// in flight, without committing the unused device timeline.
+		if playlist = s.channels.buildPlaylist(ch); playlist != "" {
+			s.write(w, http.StatusOK, "application/vnd.apple.mpegurl", []byte(playlist))
+			return
+		}
 		if deviceErr == nil {
 			ch.mu.Lock()
-			devicePlaylist = ch.output.normalize(devicePlaylist, "device-go")
+			devicePlaylist = ch.output.normalizeWithIdentity(devicePlaylist, "device-go", s.device.MediaIdentity)
 			ch.mu.Unlock()
 			w.Header().Set("X-YSP-Source", "device-go")
 			s.write(w, http.StatusOK, "application/vnd.apple.mpegurl", []byte(devicePlaylist))
 			return
 		}
 		if !errors.Is(deviceErr, errDeviceLinkQuota) && !errors.Is(deviceErr, errDeviceCoolingDown) && !errors.Is(deviceErr, context.Canceled) {
-			log.Printf("BK unavailable; built-in device %s fetch failed: %v", slug, deviceErr)
+			log.Printf("BK/JCE unavailable; built-in device %s fetch failed: %v", slug, deviceErr)
 		}
 	}
-	// A JCE playlist may already have been prepared while BK was failing. Keep
-	// it as the final fast fallback when the preferred device source is also
-	// unavailable or cooling down.
-	if playlist != "" {
+	// The shared BK/JCE refresh may have recovered while the device attempt
+	// was running. Recheck its current cache before returning an error.
+	if playlist = s.channels.buildPlaylist(ch); playlist != "" {
 		s.write(w, http.StatusOK, "application/vnd.apple.mpegurl", []byte(playlist))
 		return
 	}
 	ch.mu.Lock()
 	lastError := ch.lastError
+	bkStatus, jceStatus := ch.bkStatus, ch.jceStatus
 	ch.mu.Unlock()
 	if lastError == "" && err != nil {
 		lastError = truncateError(err, 120)
@@ -326,6 +325,21 @@ func (s *appServer) serveChannel(w http.ResponseWriter, r *http.Request, slug st
 		lastError = "正在拉取"
 	}
 	msg := fmt.Sprintf("频道 %s 暂无数据（%s），请稍后重试\n", ch.spec.Name, lastError)
+	if bkStatus != "" {
+		msg += "BK: " + bkStatus + "\n"
+	}
+	if jceStatus != "" {
+		msg += "JCE: " + jceStatus + "\n"
+	}
+	if deviceFallback {
+		deviceError := s.device.Diagnostics().Errors[slug]
+		if deviceError == "" {
+			deviceError = s.device.LastError()
+		}
+		if deviceError != "" {
+			msg += "设备源: " + deviceError + "\n"
+		}
+	}
 	w.Header().Set("Retry-After", "3")
 	s.write(w, http.StatusServiceUnavailable, "text/plain; charset=utf-8", []byte(msg))
 }

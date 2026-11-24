@@ -78,7 +78,6 @@ func main() {
 		device.Start(ctx)
 	}
 	app := newAppServer(channels, *bind, *port)
-	app.ctx = ctx
 	app.device = device
 	httpServer := &http.Server{
 		Addr:              net.JoinHostPort(*bind, strconv.Itoa(*port)),

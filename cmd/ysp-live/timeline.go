@@ -65,6 +65,10 @@ func playlistMovedBackwards(old, next string) bool {
 }
 
 func (t *playlistTimeline) normalize(text, source string) string {
+	return t.normalizeWithIdentity(text, source, func(uri string) string { return segmentKey(uri, "") })
+}
+
+func (t *playlistTimeline) normalizeWithIdentity(text, source string, mediaIdentity func(string) string) string {
 	p := mediaPosition(text)
 	if p.count == 0 {
 		return ""
@@ -81,7 +85,7 @@ func (t *playlistTimeline) normalize(text, source string) string {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		identity := segmentKey(line, "") + "|" + byteRange
+		identity := mediaIdentity(line) + "|" + byteRange
 		identities[inputIndex] = identity
 		if old, ok := t.identities[inputIndex]; ok && old != identity {
 			conflict = true

@@ -51,6 +51,11 @@ const (
 	deviceMediaLeaseTTL    = 2 * time.Minute
 	deviceLinkIdleTimeout  = 5 * time.Minute
 	deviceMaxLinks         = 6
+	deviceRefreshTimeout   = 20 * time.Second
+	deviceMaxPlaylistAge   = 30 * time.Second
+	deviceMediaTimeout     = 5 * time.Minute
+	deviceWriteIdleTimeout = 30 * time.Second
+	deviceMaxMediaRequests = 64
 )
 
 var (
@@ -167,6 +172,21 @@ func (e *deviceHTTPError) Error() string {
 type deviceFailure struct {
 	At    time.Time
 	Count int
+	Error string
+}
+
+// Progress belongs to the channel, not a signed URL or device session.
+type deviceProgress struct {
+	Playlist      string
+	LastProgress  time.Time
+	ResetPosition playlistPosition
+	ResetObserved time.Time
+}
+
+type devicePlaylistCall struct {
+	done                    chan struct{}
+	playlist, base, entryID string
+	err                     error
 }
 
 type deviceEndpoints struct {
@@ -180,7 +200,9 @@ type deviceSource interface {
 	Close()
 	Ready() bool
 	LastError() string
+	Diagnostics() deviceDiagnostics
 	FetchPlaylist(context.Context, string, string) (string, error)
+	MediaIdentity(string) string
 	ServeMedia(http.ResponseWriter, *http.Request)
 }
 
@@ -191,25 +213,34 @@ type deviceManager struct {
 	statePath     string
 	endpoints     deviceEndpoints
 
-	mu           sync.Mutex
-	session      *deviceSession
-	entries      map[string]*deviceEntry
-	mediaEntries map[string]*deviceEntry
-	linked       map[string]struct{}
-	lastAccess   map[string]time.Time
-	failures     map[string]deviceFailure
-	lastErr      string
-	nextEntryID  uint64
-	ctx          context.Context
-	cancel       context.CancelFunc
+	mu            sync.Mutex
+	session       *deviceSession
+	entries       map[string]*deviceEntry
+	mediaEntries  map[string]*deviceEntry
+	linked        map[string]struct{}
+	lastAccess    map[string]time.Time
+	failures      map[string]deviceFailure
+	progress      map[string]deviceProgress
+	flights       map[string]*devicePlaylistCall
+	lastErr       string
+	cloudAttempts []deviceCloudAttempt
+	nextEntryID   uint64
+	ctx           context.Context
+	cancel        context.CancelFunc
+	stopParent    func() bool
+	started       bool
+	stopped       bool
+	wg            sync.WaitGroup
 
-	controlMu       sync.Mutex
+	controlSlots    chan struct{}
+	mediaSlots      chan struct{}
 	lastControl     time.Time
 	controlInterval time.Duration
 	tokenKey        []byte
 }
 
 func newDeviceManager(base *http.Client, statePath string) *deviceManager {
+	ctx, cancel := context.WithCancel(context.Background())
 	sessionJar, _ := cookiejar.New(nil)
 	genericJar, _ := cookiejar.New(nil)
 	controlClient := &http.Client{Transport: base.Transport, Timeout: 15 * time.Second, Jar: sessionJar}
@@ -234,6 +265,12 @@ func newDeviceManager(base *http.Client, statePath string) *deviceManager {
 		linked:          make(map[string]struct{}),
 		lastAccess:      make(map[string]time.Time),
 		failures:        make(map[string]deviceFailure),
+		progress:        make(map[string]deviceProgress),
+		flights:         make(map[string]*devicePlaylistCall),
+		ctx:             ctx,
+		cancel:          cancel,
+		controlSlots:    make(chan struct{}, 1),
+		mediaSlots:      make(chan struct{}, deviceMaxMediaRequests),
 		controlInterval: time.Second,
 		tokenKey:        key,
 	}
@@ -241,24 +278,30 @@ func newDeviceManager(base *http.Client, statePath string) *deviceManager {
 
 func (m *deviceManager) Start(parent context.Context) {
 	m.mu.Lock()
-	if m.cancel != nil {
+	if m.started || m.stopped {
 		m.mu.Unlock()
 		return
 	}
-	m.ctx, m.cancel = context.WithCancel(parent)
+	m.started = true
+	m.stopParent = context.AfterFunc(parent, m.cancel)
 	ctx := m.ctx
+	m.wg.Add(1)
 	m.mu.Unlock()
-	go m.heartbeatLoop(ctx)
+	go func() {
+		defer m.wg.Done()
+		m.heartbeatLoop(ctx)
+	}()
 }
 
 func (m *deviceManager) Close() {
 	m.mu.Lock()
-	cancel := m.cancel
-	m.cancel = nil
-	m.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	m.stopped = true
+	m.cancel()
+	if m.stopParent != nil {
+		m.stopParent()
 	}
+	m.mu.Unlock()
+	m.wg.Wait()
 }
 
 func (m *deviceManager) Ready() bool {
@@ -281,7 +324,9 @@ func (m *deviceManager) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m.controlMu.Lock()
+			if err := m.acquireControl(ctx); err != nil {
+				return
+			}
 			m.mu.Lock()
 			session := m.session
 			m.mu.Unlock()
@@ -302,30 +347,29 @@ func (m *deviceManager) heartbeatLoop(ctx context.Context) {
 				}
 				m.mu.Unlock()
 			}
-			m.controlMu.Unlock()
+			m.releaseControl()
 		}
 	}
 }
 
 func (m *deviceManager) FetchPlaylist(ctx context.Context, slug, publicHost string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if deviceLiveIDs[slug] == "" {
 		return "", errors.New("channel is not supported by the built-in device protocol")
 	}
-	now := time.Now()
 	m.mu.Lock()
+	if m.stopped || m.ctx.Err() != nil {
+		m.mu.Unlock()
+		return "", context.Canceled
+	}
+	now := time.Now()
 	m.cleanupMediaEntriesLocked(now)
 	m.evictIdleLinksLocked(now)
-	if failure, ok := m.failures[slug]; ok {
-		delay := 15 * time.Second
-		if failure.Count == 2 {
-			delay = time.Minute
-		} else if failure.Count >= 3 {
-			delay = 2 * time.Minute
-		}
-		if now.Sub(failure.At) < delay {
-			m.mu.Unlock()
-			return "", errDeviceCoolingDown
-		}
+	if failure, ok := m.failures[slug]; ok && now.Sub(failure.At) < deviceRetryDelay(failure.Count) {
+		m.mu.Unlock()
+		return "", errDeviceCoolingDown
 	}
 	if err := m.reserveLinkLocked(slug, now); err != nil {
 		m.mu.Unlock()
@@ -333,40 +377,121 @@ func (m *deviceManager) FetchPlaylist(ctx context.Context, slug, publicHost stri
 	}
 	m.lastAccess[slug] = now
 	entry := m.entries[slug]
-	if entry != nil && now.Before(entry.ExpiresAt) && now.Sub(entry.PlaylistAt) < devicePlaylistTTL {
+	progress := m.progress[slug]
+	if entry != nil && now.Before(entry.ExpiresAt) && now.Sub(entry.PlaylistAt) < devicePlaylistTTL &&
+		(progress.LastProgress.IsZero() || now.Sub(progress.LastProgress) < deviceMaxPlaylistAge) {
 		playlist, base, entryID := entry.Playlist, entry.PlaylistBase, entry.ID
 		m.mu.Unlock()
 		return rewriteDevicePlaylist(playlist, base, publicHost, entryID, m.signMediaURL), nil
 	}
-	needsResolve := entry == nil || now.After(entry.ExpiresAt)
+	call := m.flights[slug]
+	if call == nil {
+		call = &devicePlaylistCall{done: make(chan struct{})}
+		m.flights[slug] = call
+		// Registration is serialized with Close, including requests made before Start.
+		m.wg.Add(1)
+		go m.refreshPlaylist(slug, call)
+	}
 	m.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-m.ctx.Done():
+		return "", m.ctx.Err()
+	case <-call.done:
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if call.err != nil {
+		return "", call.err
+	}
+	// Each viewer gets its own public host; the shared result contains upstream URIs.
+	return rewriteDevicePlaylist(call.playlist, call.base, publicHost, call.entryID, m.signMediaURL), nil
+}
 
+func (m *deviceManager) refreshPlaylist(slug string, call *devicePlaylistCall) {
+	defer m.wg.Done()
+	ctx, cancel := context.WithTimeout(m.ctx, deviceRefreshTimeout)
+	defer cancel()
+	call.playlist, call.base, call.entryID, call.err = m.loadPlaylist(ctx, slug)
+	if call.err != nil {
+		m.recordFailure(slug, call.err)
+	}
+	m.mu.Lock()
+	delete(m.flights, slug)
+	close(call.done)
+	m.mu.Unlock()
+}
+
+func (m *deviceManager) loadPlaylist(ctx context.Context, slug string) (string, string, string, error) {
+	m.mu.Lock()
+	entry := m.entries[slug]
+	needsResolve := entry == nil || !time.Now().Before(entry.ExpiresAt)
+	m.mu.Unlock()
 	if needsResolve {
 		var err error
 		entry, err = m.resolveEntry(ctx, slug)
 		if err != nil {
-			m.recordFailure(slug, err)
-			return "", err
+			return "", "", "", err
 		}
 	}
 	playlist, base, err := m.fetchUpstreamPlaylist(ctx, entry)
 	if err != nil {
-		m.recordFailure(slug, err)
-		return "", err
+		return "", "", "", err
 	}
 	m.mu.Lock()
-	now = time.Now()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", "", "", err
+	}
+	if m.entries[slug] != entry {
+		return "", "", "", errors.New("device session changed during refresh")
+	}
+	now := time.Now()
+	if err := m.acceptProgressLocked(slug, playlist, now); err != nil {
+		return "", "", "", err
+	}
 	key := playlistMediaKey(playlist)
 	entry.Playlist, entry.PlaylistAt, entry.PlaylistBase = playlist, now, base
 	entry.MediaLeaseAt = now.Add(deviceMediaLeaseTTL)
-	if key != "" && key != entry.PlaylistKey {
+	if key != entry.PlaylistKey {
 		entry.PlaylistKey = key
 		entry.ExpiresAt = minTime(now.Add(deviceEntryTTL), entry.SessionUntil)
 	}
 	delete(m.failures, slug)
 	m.lastErr = ""
-	m.mu.Unlock()
-	return rewriteDevicePlaylist(playlist, base, publicHost, entry.ID, m.signMediaURL), nil
+	return playlist, base, entry.ID, nil
+}
+
+// Caller holds m.mu. Renewing an entry or rotating a session must not make a
+// frozen stream healthy. A restarted encoder needs two advancing observations.
+func (m *deviceManager) acceptProgressLocked(slug, playlist string, now time.Time) error {
+	state := m.progress[slug]
+	if state.Playlist != "" && playlistMovedBackwards(state.Playlist, playlist) {
+		old, next := mediaPosition(state.Playlist), mediaPosition(playlist)
+		previous := state.ResetPosition
+		canReset := now.Sub(state.LastProgress) >= deviceMaxPlaylistAge &&
+			!state.ResetObserved.IsZero() && now.Sub(state.ResetObserved) <= 2*deviceMaxPlaylistAge &&
+			next.sequence >= previous.sequence && next.sequence+next.count > previous.sequence+previous.count &&
+			(old.lastTime.IsZero() || next.lastTime.IsZero() || next.lastTime.After(old.lastTime))
+		state.ResetPosition, state.ResetObserved = next, now
+		m.progress[slug] = state
+		if !canReset {
+			return errors.New("device playlist moved backwards")
+		}
+	}
+	if playlistMediaKey(playlist) == playlistMediaKey(state.Playlist) && !state.LastProgress.IsZero() {
+		if now.Sub(state.LastProgress) >= deviceMaxPlaylistAge {
+			return errors.New("device playlist stopped advancing")
+		}
+	} else {
+		state.LastProgress = now
+	}
+	state.Playlist = playlist
+	state.ResetPosition, state.ResetObserved = playlistPosition{}, time.Time{}
+	m.progress[slug] = state
+	return nil
 }
 
 func (m *deviceManager) evictIdleLinksLocked(now time.Time) {
@@ -398,17 +523,23 @@ func (m *deviceManager) cleanupMediaEntriesLocked(now time.Time) {
 }
 
 func (m *deviceManager) recordFailure(slug string, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, errDeviceLinkQuota) {
+		return
+	}
 	m.mu.Lock()
 	failure := m.failures[slug]
 	failure.At, failure.Count = time.Now(), failure.Count+1
+	failure.Error = diagnosticError(err, 400)
 	m.failures[slug] = failure
-	m.lastErr = slug + ": " + err.Error()
+	m.lastErr = slug + ": " + failure.Error
 	m.mu.Unlock()
 }
 
 func (m *deviceManager) resolveEntry(ctx context.Context, slug string) (*deviceEntry, error) {
-	m.controlMu.Lock()
-	defer m.controlMu.Unlock()
+	if err := m.acquireControl(ctx); err != nil {
+		return nil, err
+	}
+	defer m.releaseControl()
 	m.mu.Lock()
 	if entry := m.entries[slug]; entry != nil && time.Now().Before(entry.ExpiresAt) {
 		m.mu.Unlock()
@@ -496,9 +627,6 @@ func (m *deviceManager) ensureSessionLocked(ctx context.Context) (*deviceSession
 		return nil, err
 	}
 	if guid == "" {
-		guid = state.CloudGUID
-	}
-	if guid == "" {
 		return nil, errors.New("device cloud registration returned an empty guid")
 	}
 	session = &deviceSession{Identity: identity, Profile: state.Profile, SessionKey: sessionKey, CloudGUID: guid, CreatedAt: time.Now()}
@@ -565,6 +693,25 @@ func minTime(a, b time.Time) time.Time {
 	}
 	return b
 }
+
+// Unlike a mutex, waiting for the control API must respect cancellation.
+func (m *deviceManager) acquireControl(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case m.controlSlots <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			m.releaseControl()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *deviceManager) releaseControl() { <-m.controlSlots }
 
 func (m *deviceManager) waitControl(ctx context.Context) error {
 	wait := m.controlInterval - time.Since(m.lastControl)
@@ -644,68 +791,6 @@ func (m *deviceManager) appStart(ctx context.Context, profile deviceProfile, ide
 		}
 	}
 	return "", identity, fmt.Errorf("device app/start failed: %w", lastErr)
-}
-
-func (m *deviceManager) cloudRegistration(ctx context.Context, identity deviceIdentity) (string, error) {
-	encrypted, err := encryptDeviceID(identity.XUID)
-	if err != nil {
-		return "", err
-	}
-	body := map[string]any{"device_name": deviceName, "device_id": encrypted}
-	request := func(endpoint string) (map[string]any, error) {
-		payload, _ := marshalDeviceJSON(body, false)
-		data, status, err := m.genericRequest(ctx, http.MethodPost, endpoint, freshDeviceHeaders(identity, "application/json", "application/json", 0, ""), payload)
-		if err != nil {
-			return nil, err
-		}
-		var value map[string]any
-		if err := json.Unmarshal(data, &value); err != nil {
-			if status/100 != 2 {
-				return nil, &deviceHTTPError{Stage: "cloud device", Status: status, Body: truncateError(errors.New(string(data)), 240)}
-			}
-			return nil, err
-		}
-		// The cloud API reports normal business states (notably result=2,
-		// "registration required") with HTTP 400. Its JSON result code is the
-		// protocol status and must be interpreted before the HTTP status.
-		return value, nil
-	}
-	value, err := request(m.endpoints.CloudGet)
-	if err != nil {
-		return "", err
-	}
-	if code := resultCode(value); code == 0 {
-		if guid := extractDeviceGUID(value); guid != "" {
-			return guid, nil
-		}
-		// Some cloud responses report success for a known-but-unregistered
-		// identity without returning a guid. Continue through registration
-		// instead of treating the empty value as a usable session.
-	} else if code != 601 && code != 2 {
-		return "", fmt.Errorf("cloud device get returned result %d", code)
-	}
-	var code int
-	for attempt := 0; attempt < 2; attempt++ {
-		value, err = request(m.endpoints.CloudRegister)
-		if err != nil {
-			return "", err
-		}
-		code = resultCode(value)
-		if guid := extractDeviceGUID(value); guid != "" {
-			return guid, nil
-		}
-		if code != 695 {
-			break
-		}
-	}
-	if code == 0 || code == 694 || code == 2 {
-		value, err = request(m.endpoints.CloudGet)
-		if err != nil {
-			return "", err
-		}
-		return extractDeviceGUID(value), nil
-	}
-	return "", fmt.Errorf("cloud device registration returned result %d", code)
 }
 
 func (m *deviceManager) heartbeat(ctx context.Context, session *deviceSession) error {
@@ -849,10 +934,52 @@ func (m *deviceManager) fetchUpstreamPlaylist(ctx context.Context, entry *device
 		return "", "", err
 	}
 	playlist := string(body)
+	if !strings.HasPrefix(playlist, "#EXTM3U\n") && !strings.HasPrefix(playlist, "#EXTM3U\r\n") {
+		return "", "", errors.New("device response is not an M3U8 playlist")
+	}
 	if err := validateMediaPlaylist(playlist); err != nil {
 		return "", "", err
 	}
-	return playlist, resp.Request.URL.String(), nil
+	base := resp.Request.URL
+	resolve := func(raw string) string {
+		rel, parseErr := url.Parse(raw)
+		if parseErr == nil {
+			absolute := base.ResolveReference(rel)
+			if (absolute.Scheme == "http" || absolute.Scheme == "https") && absolute.Hostname() != "" {
+				return absolute.String()
+			}
+		}
+		err = errors.New("unsupported device media URI")
+		return raw
+	}
+	lines := strings.Split(playlist, "\n")
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#EXT-X-KEY:") || strings.HasPrefix(line, "#EXT-X-MAP:") {
+			_, value, _ := strings.Cut(line, ":")
+			attrs, parseErr := playlistAttributes(value)
+			if parseErr != nil {
+				return "", "", parseErr
+			}
+			isKey := strings.HasPrefix(line, "#EXT-X-KEY:")
+			if isKey && attrs["METHOD"] != "NONE" &&
+				(attrs["METHOD"] != "AES-128" || (attrs["KEYFORMAT"] != "" && attrs["KEYFORMAT"] != "identity")) {
+				return "", "", errors.New("unsupported device encryption")
+			}
+			if (!isKey || attrs["METHOD"] != "NONE") && attrs["URI"] == "" {
+				return "", "", errors.New("device KEY or MAP has no URI")
+			}
+		}
+		if strings.HasPrefix(line, "#") {
+			lines[i] = mapURIAttributes(line, resolve)
+		} else if line != "" {
+			lines[i] = resolve(line)
+		}
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return strings.Join(lines, "\n"), base.String(), nil
 }
 
 func rewriteDevicePlaylist(playlist, base, publicHost, entryID string, signer func(string, string) string) string {
@@ -861,18 +988,35 @@ func rewriteDevicePlaylist(playlist, base, publicHost, entryID string, signer fu
 		return playlist
 	}
 	var out strings.Builder
+	rewrite := func(raw string) string {
+		if ref, parseErr := url.Parse(raw); parseErr == nil {
+			realURL := baseURL.ResolveReference(ref).String()
+			return "http://" + publicHost + "/_device/media/" + signer(entryID, realURL)
+		}
+		return raw
+	}
 	for _, line := range strings.Split(playlist, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
-			if ref, parseErr := url.Parse(trimmed); parseErr == nil {
-				realURL := baseURL.ResolveReference(ref).String()
-				line = "http://" + publicHost + "/_device/media/" + signer(entryID, realURL)
-			}
+		if strings.HasPrefix(trimmed, "#") {
+			line = mapURIAttributes(line, rewrite)
+		} else if trimmed != "" {
+			line = rewrite(trimmed)
 		}
 		out.WriteString(line)
 		out.WriteByte('\n')
 	}
 	return out.String()
+}
+
+// Compare original media identities, not relay tokens containing rotating
+// signatures and entry IDs. Verify the token before interpreting its payload.
+func (m *deviceManager) MediaIdentity(raw string) string {
+	if u, err := url.Parse(raw); err == nil && strings.HasPrefix(u.Path, "/_device/media/") {
+		if _, realURL, err := m.decodeMediaURL(strings.TrimPrefix(u.Path, "/_device/media/")); err == nil {
+			return segmentKey(realURL, "")
+		}
+	}
+	return segmentKey(raw, "")
 }
 
 func (m *deviceManager) signMediaURL(entryID, realURL string) string {
@@ -885,8 +1029,8 @@ func (m *deviceManager) signMediaURL(entryID, realURL string) string {
 }
 
 func (m *deviceManager) decodeMediaURL(token string) (string, string, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(token)
-	if err != nil || len(raw) < 17 {
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(token)
+	if err != nil || len(raw) < 17 || base64.RawURLEncoding.EncodeToString(raw) != token {
 		return "", "", errors.New("invalid device media token")
 	}
 	payload, tag := raw[:len(raw)-16], raw[len(raw)-16:]
@@ -910,15 +1054,30 @@ func (m *deviceManager) ServeMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.mu.Lock()
+	if m.stopped || m.ctx.Err() != nil {
+		m.mu.Unlock()
+		http.Error(w, "device service stopped", http.StatusServiceUnavailable)
+		return
+	}
 	now := time.Now()
 	m.cleanupMediaEntriesLocked(now)
 	entry := m.mediaEntries[entryID]
 	if entry != nil {
 		m.lastAccess[entry.Slug] = now
+		m.wg.Add(1)
 	}
 	m.mu.Unlock()
 	if entry == nil {
 		http.Error(w, "device media session expired", http.StatusGone)
+		return
+	}
+	defer m.wg.Done()
+	select {
+	case m.mediaSlots <- struct{}{}:
+		defer func() { <-m.mediaSlots }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "device media capacity reached", http.StatusServiceUnavailable)
 		return
 	}
 	parsed, err := url.Parse(realURL)
@@ -926,8 +1085,10 @@ func (m *deviceManager) ServeMedia(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid device media URL", http.StatusBadRequest)
 		return
 	}
-	mediaCtx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	mediaCtx, cancel := context.WithTimeout(r.Context(), deviceMediaTimeout)
 	defer cancel()
+	stopShutdown := context.AfterFunc(m.ctx, cancel)
+	defer stopShutdown()
 	req, err := http.NewRequestWithContext(mediaCtx, r.Method, realURL, nil)
 	if err != nil {
 		http.Error(w, "invalid device media request", http.StatusBadGateway)
@@ -952,11 +1113,53 @@ func (m *deviceManager) ServeMedia(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	controller := http.NewResponseController(w)
+	// Context cancellation interrupts upstream reads, but not a blocked socket
+	// write. Explicitly expire the downstream deadline too, and join the callback
+	// before returning so it cannot affect another request on this connection.
+	writeCanceled := make(chan struct{})
+	stopWrite := context.AfterFunc(mediaCtx, func() {
+		_ = controller.SetWriteDeadline(time.Now())
+		close(writeCanceled)
+	})
+	defer func() {
+		if !stopWrite() {
+			<-writeCanceled
+		}
+	}()
+	writer := &deviceMediaWriter{w: w, controller: controller, ctx: mediaCtx}
+	if err := writer.setDeadline(); err != nil {
+		return
+	}
 	w.WriteHeader(resp.StatusCode)
 	if r.Method != http.MethodHead {
-		_, _ = io.CopyBuffer(w, resp.Body, make([]byte, 128<<10))
+		_, _ = io.CopyBuffer(writer, resp.Body, make([]byte, 128<<10))
 	}
+}
+
+type deviceMediaWriter struct {
+	w          http.ResponseWriter
+	controller *http.ResponseController
+	ctx        context.Context
+}
+
+func (w *deviceMediaWriter) setDeadline() error {
+	deadline := time.Now().Add(deviceWriteIdleTimeout)
+	if end, ok := w.ctx.Deadline(); ok && end.Before(deadline) {
+		deadline = end
+	}
+	if err := w.controller.SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	// Check after setting the deadline: cancellation may have raced with it.
+	return w.ctx.Err()
+}
+
+func (w *deviceMediaWriter) Write(p []byte) (int, error) {
+	if err := w.setDeadline(); err != nil {
+		return 0, err
+	}
+	return w.w.Write(p)
 }
 
 func freshDeviceHeaders(identity deviceIdentity, contentType, accept string, forceTimestamp int64, uid string) http.Header {

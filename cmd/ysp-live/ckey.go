@@ -368,6 +368,15 @@ func bkPlayURLs(ctx context.Context, client *http.Client, channelID, livePID, de
 }
 
 func rewriteURIAttributes(line string, base *url.URL) string {
+	return mapURIAttributes(line, func(raw string) string {
+		if rel, err := url.Parse(raw); err == nil {
+			return base.ResolveReference(rel).String()
+		}
+		return raw
+	})
+}
+
+func mapURIAttributes(line string, rewrite func(string) string) string {
 	const marker = `URI="`
 	for start := 0; ; {
 		i := strings.Index(line[start:], marker)
@@ -380,14 +389,9 @@ func rewriteURIAttributes(line string, base *url.URL) string {
 			return line
 		}
 		j += i
-		rel, err := url.Parse(line[i:j])
-		if err == nil {
-			absolute := base.ResolveReference(rel).String()
-			line = line[:i] + absolute + line[j:]
-			start = i + len(absolute) + 1
-		} else {
-			start = j + 1
-		}
+		replacement := rewrite(line[i:j])
+		line = line[:i] + replacement + line[j:]
+		start = i + len(replacement) + 1
 	}
 }
 

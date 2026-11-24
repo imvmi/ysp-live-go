@@ -138,6 +138,8 @@ type channel struct {
 	wake           chan struct{}
 	nextRetry      time.Time
 	lastError      string
+	bkStatus       string
+	jceStatus      string
 	lastOK         time.Time
 	lastProgress   time.Time
 	lastMedia      string
@@ -498,12 +500,16 @@ func (m *channelManager) refreshOnce(ctx context.Context, ch *channel) bool {
 		}
 		attempt, cancel := context.WithTimeout(ctx, budget)
 		defer cancel()
-		return m.bkRefresh(attempt, ch)
+		err := m.bkRefresh(attempt, ch)
+		m.recordSourceStatus(ch, "bk", err)
+		return err
 	}
 	tryJCE := func() error {
 		attempt, cancel := context.WithTimeout(ctx, 12*time.Second)
 		defer cancel()
-		return m.jceRefresh(attempt, ch)
+		err := m.jceRefresh(attempt, ch)
+		m.recordSourceStatus(ch, "jce", err)
+		return err
 	}
 	if mode == "bk" {
 		err = tryBK(false)
@@ -548,6 +554,22 @@ func (m *channelManager) refreshOnce(ctx context.Context, ch *channel) bool {
 	return m.finishRefresh(ch, started, err)
 }
 
+// Preserve each source's most recent attempt independently: a long BK error
+// must not hide the JCE failure or a failed BK probe behind healthy JCE output.
+func (m *channelManager) recordSourceStatus(ch *channel, source string, err error) {
+	status := "ok"
+	if err != nil {
+		status = diagnosticError(err, 400)
+	}
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	if source == "bk" {
+		ch.bkStatus = status
+	} else {
+		ch.jceStatus = status
+	}
+}
+
 func (m *channelManager) finishRefresh(ch *channel, started time.Time, err error) bool {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
@@ -566,7 +588,7 @@ func (m *channelManager) finishRefresh(ch *channel, started time.Time, err error
 		}
 	}
 	if err != nil {
-		ch.lastError = truncateError(err, 120)
+		ch.lastError = diagnosticError(err, 240)
 		if strings.Contains(err.Error(), "操作过于频繁") {
 			ch.rateLimited++
 		}
@@ -754,6 +776,12 @@ func (m *channelManager) ensure(ctx context.Context, ch *channel) error {
 func (m *channelManager) buildPlaylist(ch *channel) string {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
+	return m.buildPlaylistLocked(ch)
+}
+
+// Caller holds ch.mu and has selected this source for the response. Building
+// a playlist commits the client-visible timeline, so do not build candidates.
+func (m *channelManager) buildPlaylistLocked(ch *channel) string {
 	if !m.freshLocked(ch) {
 		return ""
 	}
@@ -805,6 +833,8 @@ type channelDiagnostic struct {
 	SourceHost    string
 	LastOK        time.Time
 	LastError     string
+	BKStatus      string
+	JCEStatus     string
 	LastRefresh   time.Duration
 	RateLimited   uint64
 	WorkerRunning bool
@@ -833,6 +863,7 @@ func (m *channelManager) diagnostics() []channelDiagnostic {
 		result = append(result, channelDiagnostic{
 			Slug: spec.Slug, Mode: ch.mode, SourceHost: sourceHost,
 			LastOK: ch.lastOK, LastError: ch.lastError, LastRefresh: ch.lastRefresh,
+			BKStatus: ch.bkStatus, JCEStatus: ch.jceStatus,
 			RateLimited: ch.rateLimited, WorkerRunning: ch.workerRunning,
 			Fresh: m.freshLocked(ch), LastProgress: ch.lastProgress,
 		})
